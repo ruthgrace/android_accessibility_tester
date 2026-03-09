@@ -652,6 +652,103 @@ If any key elements are missing or the description doesn't match, set result to 
         with open(local_path, "r") as f:
             return f.read()
 
+    def check_element_exists(self, content_desc: Optional[str] = None,
+                             text: Optional[str] = None,
+                             wait_after_dump: float = 0.5) -> bool:
+        """Check if an element exists in the UI hierarchy.
+
+        Runs uiautomator dump, pulls XML, and searches for matching attributes.
+        If wait_after_dump > 0, waits that long and re-dumps to account for
+        accessibility service reconnection after uiautomator disconnects it.
+
+        Args:
+            content_desc: Content description to search for (exact match)
+            text: Text content to search for (exact match)
+            wait_after_dump: Seconds to wait and re-dump after initial dump (default 0.5)
+
+        Returns:
+            True if a matching element was found, False otherwise
+        """
+        try:
+            device_path = "/sdcard/ui_hierarchy_check.xml"
+            self.shell(f"uiautomator dump {device_path}")
+
+            if wait_after_dump > 0:
+                time.sleep(wait_after_dump)
+                self.shell(f"uiautomator dump {device_path}")
+
+            local_path = "/tmp/ui_hierarchy_check.xml"
+            cmd = self._get_adb_command() + ["pull", device_path, local_path]
+            subprocess.run(cmd, capture_output=True, check=True)
+
+            with open(local_path, 'r') as f:
+                xml_content = f.read()
+            root = ET.fromstring(xml_content)
+
+            for node in root.iter():
+                if content_desc and node.get('content-desc') == content_desc:
+                    return True
+                if text and node.get('text') == text:
+                    return True
+
+            return False
+        except Exception as e:
+            print(f"Error checking UI hierarchy: {e}")
+            return False
+
+    def save_debug_artifacts(self, output_dir: str, test_name: str, step_name: str,
+                             screenshot: bool = True, ui_dump: bool = True) -> dict:
+        """Save screenshot and/or UI dump as debug artifacts.
+
+        Captures a fresh screenshot and UI hierarchy dump, saving them with
+        timestamped filenames for post-mortem debugging.
+
+        Args:
+            output_dir: Directory to save artifacts (created if it doesn't exist)
+            test_name: Name of the test (used in filename)
+            step_name: Name of the step (used in filename)
+            screenshot: Whether to capture and save a screenshot (default True)
+            ui_dump: Whether to capture and save a UI dump (default True)
+
+        Returns:
+            Dict with saved file paths: {"screenshot": path_or_None, "ui_dump": path_or_None}
+        """
+        import shutil
+        from datetime import datetime
+
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        result = {"screenshot": None, "ui_dump": None}
+
+        if screenshot:
+            try:
+                tmp_path = "/tmp/debug_screenshot.png"
+                self.screenshot(tmp_path)
+                dest = os.path.join(output_dir, f"{test_name}_{step_name}_{timestamp}.png")
+                shutil.copy(tmp_path, dest)
+                print(f"Saved screenshot to: {dest}")
+                result["screenshot"] = dest
+            except Exception as e:
+                print(f"Failed to save screenshot: {e}")
+
+        if ui_dump:
+            try:
+                device_dump_path = "/sdcard/window_dump.xml"
+                self.shell(f"uiautomator dump {device_dump_path}")
+                dest = os.path.join(output_dir, f"{test_name}_{step_name}_{timestamp}_uidump.xml")
+                cmd = self._get_adb_command() + ["pull", device_dump_path, dest]
+                pull_result = subprocess.run(cmd, capture_output=True, text=True)
+                if pull_result.returncode == 0:
+                    print(f"Saved UI dump to: {dest}")
+                    result["ui_dump"] = dest
+                    self.shell(f"rm {device_dump_path}")
+                else:
+                    print(f"Failed to pull UI dump: {pull_result.stderr}")
+            except Exception as e:
+                print(f"Failed to save UI dump: {e}")
+
+        return result
+
     def _parse_bounds(self, bounds_str: str) -> Tuple[int, int, int, int]:
         """
         Parse bounds string from UI hierarchy XML.
