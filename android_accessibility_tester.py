@@ -158,8 +158,11 @@ class AndroidAccessibilityTester:
         cmd = self._get_adb_command() + ["pull", device_path, output_path]
         subprocess.run(cmd, capture_output=True, check=True)
 
-        # Clean up device screenshot
-        self.shell(f"rm {device_path}")
+        # Clean up device screenshot (ignore failure — scoped storage may block rm)
+        try:
+            self.shell(f"rm {device_path}")
+        except subprocess.CalledProcessError:
+            pass
 
         return output_path
 
