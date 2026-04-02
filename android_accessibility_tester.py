@@ -468,9 +468,11 @@ If any key elements are missing or the description doesn't match, set result to 
 
     @timing
     def wait_for_pixel_color(self, x: int, y: int, target_color,
-                              timeout: float = 10.0, poll_interval: float = 0.5) -> dict:
+                              timeout: float = 10.0, poll_interval: float = 0.5,
+                              exclude: bool = False) -> dict:
         """
         Wait for a pixel at the given coordinates to become a specific color or one of multiple acceptable colors.
+        With exclude=True, waits for the pixel to become any color OTHER than the specified colors.
 
         This is useful for waiting for UI elements to reach a specific state
         (e.g., button turning green when enabled, or overlay appearing in light/dark mode).
@@ -485,14 +487,15 @@ If any key elements are missing or the description doesn't match, set result to 
                 - List of RGB tuples (e.g., [(255, 0, 0), (0, 255, 0)])
             timeout: Maximum time to wait in seconds (default: 10.0)
             poll_interval: Time between checks in seconds (default: 0.5)
+            exclude: If True, wait for the pixel to NOT be any of the target colors (default: False)
 
         Returns:
             Dictionary with:
-                - 'matched': bool - Whether the pixel reached one of the target colors
+                - 'matched': bool - Whether the condition was met (color matched, or excluded colors avoided)
                 - 'initial_color': str - Hex color code of initial pixel
                 - 'final_color': str - Hex color code of final pixel
                 - 'target_color': str or list - Hex color code(s) of target color(s)
-                - 'matched_color': str - Which target color was matched (if matched)
+                - 'matched_color': str - Which target color was matched (if matched and not exclude mode)
                 - 'error': str - Error message if timeout occurred
 
         Example:
@@ -503,6 +506,9 @@ If any key elements are missing or the description doesn't match, set result to 
             result = tester.wait_for_pixel_color(300, 1380, ['#fffad0', '#d2cea4'], timeout=30.0)
             if result['matched']:
                 print(f"Pixel matched {result['matched_color']}")
+
+            # Wait for pixel to become any color OTHER than the background colors
+            result = tester.wait_for_pixel_color(300, 1380, ['#ffffff', '#1b1b1b'], exclude=True, timeout=30.0)
         """
         if Image is None:
             raise RuntimeError("PIL/Pillow is required for pixel operations. Install with: pip install Pillow")
@@ -536,26 +542,45 @@ If any key elements are missing or the description doesn't match, set result to 
             initial_color = self._get_pixel_color(initial_screenshot, x, y)
             initial_hex = f"#{initial_color[0]:02x}{initial_color[1]:02x}{initial_color[2]:02x}"
 
-            # Check if already at one of the target colors
-            for i, target_rgb in enumerate(target_rgb_list):
-                if initial_color == target_rgb:
-                    matched_hex = target_hex_list[i]
+            # Check if condition already met
+            if exclude:
+                # In exclude mode, check that pixel is NOT any of the target colors
+                is_excluded = any(initial_color == t for t in target_rgb_list)
+                if not is_excluded:
                     import sys
                     if '-v' in sys.argv or '--verbose' in sys.argv:
-                        print(f"⏱️  Pixel at ({x}, {y}) already at target color {matched_hex}")
+                        print(f"⏱️  Pixel at ({x}, {y}) already not an excluded color (is {initial_hex})")
                     return {
                         'matched': True,
                         'initial_color': initial_hex,
                         'final_color': initial_hex,
                         'target_color': target_hex,
-                        'matched_color': matched_hex,
+                        'matched_color': None,
                         'error': None
                     }
+            else:
+                for i, target_rgb in enumerate(target_rgb_list):
+                    if initial_color == target_rgb:
+                        matched_hex = target_hex_list[i]
+                        import sys
+                        if '-v' in sys.argv or '--verbose' in sys.argv:
+                            print(f"⏱️  Pixel at ({x}, {y}) already at target color {matched_hex}")
+                        return {
+                            'matched': True,
+                            'initial_color': initial_hex,
+                            'final_color': initial_hex,
+                            'target_color': target_hex,
+                            'matched_color': matched_hex,
+                            'error': None
+                        }
 
             import sys
             if '-v' in sys.argv or '--verbose' in sys.argv:
                 target_display = target_hex if isinstance(target_hex, str) else f"one of {target_hex}"
-                print(f"⏱️  Waiting for pixel at ({x}, {y}) to change from {initial_hex} to {target_display}...")
+                if exclude:
+                    print(f"⏱️  Waiting for pixel at ({x}, {y}) to change from {initial_hex} to anything except {target_display}...")
+                else:
+                    print(f"⏱️  Waiting for pixel at ({x}, {y}) to change from {initial_hex} to {target_display}...")
             start_time = time.time()
 
             while time.time() - start_time < timeout:
@@ -568,22 +593,37 @@ If any key elements are missing or the description doesn't match, set result to 
                 try:
                     self.screenshot(current_screenshot)
                     current_color = self._get_pixel_color(current_screenshot, x, y)
+                    current_hex = f"#{current_color[0]:02x}{current_color[1]:02x}{current_color[2]:02x}"
 
-                    # Check if color matches any of the target colors
-                    for i, target_rgb in enumerate(target_rgb_list):
-                        if current_color == target_rgb:
+                    if exclude:
+                        # Check that pixel is NOT any of the excluded colors
+                        is_excluded = any(current_color == t for t in target_rgb_list)
+                        if not is_excluded:
                             elapsed = time.time() - start_time
-                            final_hex = f"#{current_color[0]:02x}{current_color[1]:02x}{current_color[2]:02x}"
-                            matched_hex = target_hex_list[i]
-                            print(f"⏱️  ✅ Pixel color matched after {elapsed:.3f}s ({initial_hex} -> {final_hex})")
+                            print(f"⏱️  ✅ Pixel color is not an excluded color after {elapsed:.3f}s ({initial_hex} -> {current_hex})")
                             return {
                                 'matched': True,
                                 'initial_color': initial_hex,
-                                'final_color': final_hex,
+                                'final_color': current_hex,
                                 'target_color': target_hex,
-                                'matched_color': matched_hex,
+                                'matched_color': None,
                                 'error': None
                             }
+                    else:
+                        # Check if color matches any of the target colors
+                        for i, target_rgb in enumerate(target_rgb_list):
+                            if current_color == target_rgb:
+                                elapsed = time.time() - start_time
+                                matched_hex = target_hex_list[i]
+                                print(f"⏱️  ✅ Pixel color matched after {elapsed:.3f}s ({initial_hex} -> {current_hex})")
+                                return {
+                                    'matched': True,
+                                    'initial_color': initial_hex,
+                                    'final_color': current_hex,
+                                    'target_color': target_hex,
+                                    'matched_color': matched_hex,
+                                    'error': None
+                                }
                 finally:
                     # Clean up current screenshot
                     if os.path.exists(current_screenshot):
@@ -602,35 +642,125 @@ If any key elements are missing or the description doesn't match, set result to 
                 if os.path.exists(final_screenshot):
                     os.unlink(final_screenshot)
 
-            # Check if the final color matches any target (race condition: might have changed after timeout)
-            for i, target_rgb in enumerate(target_rgb_list):
-                if final_color == target_rgb:
-                    matched_hex = target_hex_list[i]
-                    print(f"⏱️  ✅ Pixel color matched after {elapsed:.3f}s ({initial_hex} -> {final_hex}) [detected on timeout]")
+            # Check if the final color meets condition (race condition: might have changed after timeout)
+            if exclude:
+                is_excluded = any(final_color == t for t in target_rgb_list)
+                if not is_excluded:
+                    print(f"⏱️  ✅ Pixel color is not an excluded color after {elapsed:.3f}s ({initial_hex} -> {final_hex}) [detected on timeout]")
                     return {
                         'matched': True,
                         'initial_color': initial_hex,
                         'final_color': final_hex,
                         'target_color': target_hex,
-                        'matched_color': matched_hex,
+                        'matched_color': None,
                         'error': None
                     }
+            else:
+                for i, target_rgb in enumerate(target_rgb_list):
+                    if final_color == target_rgb:
+                        matched_hex = target_hex_list[i]
+                        print(f"⏱️  ✅ Pixel color matched after {elapsed:.3f}s ({initial_hex} -> {final_hex}) [detected on timeout]")
+                        return {
+                            'matched': True,
+                            'initial_color': initial_hex,
+                            'final_color': final_hex,
+                            'target_color': target_hex,
+                            'matched_color': matched_hex,
+                            'error': None
+                        }
 
             target_display = target_hex if isinstance(target_hex, str) else ', '.join(target_hex)
-            print(f"⏱️  ❌ Timeout after {elapsed:.3f}s - pixel at ({x}, {y}) is {final_hex}, expected {target_display}")
-            return {
-                'matched': False,
-                'initial_color': initial_hex,
-                'final_color': final_hex,
-                'target_color': target_hex,
-                'matched_color': None,
-                'error': f'Timeout after {timeout}s - pixel at ({x}, {y}) is {final_hex}, expected {target_display}'
-            }
+            if exclude:
+                print(f"⏱️  ❌ Timeout after {elapsed:.3f}s - pixel at ({x}, {y}) is {final_hex}, expected anything except {target_display}")
+                return {
+                    'matched': False,
+                    'initial_color': initial_hex,
+                    'final_color': final_hex,
+                    'target_color': target_hex,
+                    'matched_color': None,
+                    'error': f'Timeout after {timeout}s - pixel at ({x}, {y}) is {final_hex}, expected anything except {target_display}'
+                }
+            else:
+                print(f"⏱️  ❌ Timeout after {elapsed:.3f}s - pixel at ({x}, {y}) is {final_hex}, expected {target_display}")
+                return {
+                    'matched': False,
+                    'initial_color': initial_hex,
+                    'final_color': final_hex,
+                    'target_color': target_hex,
+                    'matched_color': None,
+                    'error': f'Timeout after {timeout}s - pixel at ({x}, {y}) is {final_hex}, expected {target_display}'
+                }
 
         finally:
             # Clean up initial screenshot
             if os.path.exists(initial_screenshot):
                 os.unlink(initial_screenshot)
+
+    def wait_for_logcat(self, tag: str, message: str, timeout: float = 30.0,
+                        clear_first: bool = True) -> dict:
+        """
+        Wait for a specific logcat message to appear.
+
+        Monitors logcat for a log line matching the given tag and message substring.
+        This is useful for waiting on app-internal events like overlay creation,
+        service starts, or state changes without relying on UI pixel colors.
+
+        Args:
+            tag: Logcat tag to filter on (e.g., 'MessageDraftOverlay')
+            message: Substring to search for in the log message
+            timeout: Maximum time to wait in seconds (default: 30.0)
+            clear_first: If True, clears logcat before waiting to avoid matching old entries (default: True)
+
+        Returns:
+            Dictionary with:
+                - 'matched': bool - Whether the log message was found
+                - 'line': str - The full matching log line (if matched)
+                - 'error': str - Error message if timeout occurred
+        """
+        adb_cmd = self._get_adb_command()
+
+        if clear_first:
+            subprocess.run(adb_cmd + ["logcat", "-c"], capture_output=True)
+
+        # Start logcat filtered by tag
+        proc = subprocess.Popen(
+            adb_cmd + ["logcat", "-v", "brief", f"{tag}:D", "*:S"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        import sys
+        if '-v' in sys.argv or '--verbose' in sys.argv:
+            print(f"⏱️  Waiting for logcat tag={tag} message containing '{message}'...")
+
+        start_time = time.time()
+        try:
+            import select
+            while time.time() - start_time < timeout:
+                # Use select to poll stdout with a short timeout
+                ready, _, _ = select.select([proc.stdout], [], [], 0.5)
+                if ready:
+                    line = proc.stdout.readline()
+                    if line and message in line:
+                        elapsed = time.time() - start_time
+                        print(f"⏱️  ✅ Logcat matched after {elapsed:.3f}s: {line.strip()}")
+                        return {
+                            'matched': True,
+                            'line': line.strip(),
+                            'error': None
+                        }
+
+            elapsed = time.time() - start_time
+            print(f"⏱️  ❌ Logcat timeout after {elapsed:.3f}s - never saw '{message}' in tag {tag}")
+            return {
+                'matched': False,
+                'line': None,
+                'error': f'Timeout after {timeout}s - never saw "{message}" in tag {tag}'
+            }
+        finally:
+            proc.terminate()
+            proc.wait()
 
     def _get_ui_hierarchy(self) -> str:
         """

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="android-accessibility-tester",
-    version="2.0.1",
+    version="2.1.0",
     description="Python library for testing Android apps with accessibility features using ADB and Claude LLM",
     author="Your Name",
     py_modules=["android_accessibility_tester"],
