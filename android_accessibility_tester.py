@@ -727,7 +727,8 @@ If any key elements are missing or the description doesn't match, set result to 
             adb_cmd + ["logcat", "-v", "brief", f"{tag}:D", "*:S"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            bufsize=1  # Line-buffered for reliable readline
         )
 
         import sys
@@ -736,20 +737,29 @@ If any key elements are missing or the description doesn't match, set result to 
 
         start_time = time.time()
         try:
-            import select
+            import threading
+
+            matched_line = [None]
+
+            def reader():
+                for line in proc.stdout:
+                    if message in line:
+                        matched_line[0] = line.strip()
+                        return
+
+            reader_thread = threading.Thread(target=reader, daemon=True)
+            reader_thread.start()
+
             while time.time() - start_time < timeout:
-                # Use select to poll stdout with a short timeout
-                ready, _, _ = select.select([proc.stdout], [], [], 0.5)
-                if ready:
-                    line = proc.stdout.readline()
-                    if line and message in line:
-                        elapsed = time.time() - start_time
-                        print(f"⏱️  ✅ Logcat matched after {elapsed:.3f}s: {line.strip()}")
-                        return {
-                            'matched': True,
-                            'line': line.strip(),
-                            'error': None
-                        }
+                reader_thread.join(timeout=0.5)
+                if matched_line[0] is not None:
+                    elapsed = time.time() - start_time
+                    print(f"⏱️  ✅ Logcat matched after {elapsed:.3f}s: {matched_line[0]}")
+                    return {
+                        'matched': True,
+                        'line': matched_line[0],
+                        'error': None
+                    }
 
             elapsed = time.time() - start_time
             print(f"⏱️  ❌ Logcat timeout after {elapsed:.3f}s - never saw '{message}' in tag {tag}")
