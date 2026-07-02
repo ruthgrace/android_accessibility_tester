@@ -103,11 +103,11 @@ class AndroidAccessibilityTester:
 
         Args:
             device_id: Specific Android device ID. If None, uses the first available device.
-            model: Claude model to use for assertions. If None, defaults to "claude-sonnet-4-20250514".
+            model: Claude model to use for assertions. If None, defaults to "claude-sonnet-4-6".
             api_key: Anthropic API key. If None, uses ANTHROPIC_API_KEY environment variable.
         """
         self.device_id = device_id
-        self.default_model = model or "claude-sonnet-4-20250514"
+        self.default_model = model or "claude-sonnet-4-6"
         self.client = Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
         self._verify_adb()
 
@@ -232,7 +232,7 @@ If any key elements are missing or the description doesn't match, set result to 
                 )
 
                 # Parse response
-                response_text = message.content[0].text.strip()
+                response_text = next(b.text for b in message.content if b.type == "text").strip()
 
                 # Strip markdown code blocks if present
                 if response_text.startswith("```"):
@@ -840,11 +840,16 @@ If any key elements are missing or the description doesn't match, set result to 
             return False
 
     def save_debug_artifacts(self, output_dir: str, test_name: str, step_name: str,
-                             screenshot: bool = True, ui_dump: bool = True) -> dict:
+                             screenshot: bool = True, ui_dump: bool = True,
+                             existing_screenshot: Optional[str] = None) -> dict:
         """Save screenshot and/or UI dump as debug artifacts.
 
-        Captures a fresh screenshot and UI hierarchy dump, saving them with
-        timestamped filenames for post-mortem debugging.
+        Saves a screenshot and UI hierarchy dump with timestamped filenames for
+        post-mortem debugging. If `existing_screenshot` is provided and readable,
+        that file is copied instead of capturing a new one — use this when the
+        failure was detected against a specific screenshot (e.g. a
+        validate_screenshot failure) so the saved artifact matches what the
+        validator actually saw. Otherwise a fresh screenshot is captured.
 
         Args:
             output_dir: Directory to save artifacts (created if it doesn't exist)
@@ -852,6 +857,9 @@ If any key elements are missing or the description doesn't match, set result to 
             step_name: Name of the step (used in filename)
             screenshot: Whether to capture and save a screenshot (default True)
             ui_dump: Whether to capture and save a UI dump (default True)
+            existing_screenshot: Optional path to an already-captured screenshot
+                to preserve. If set and the file exists, it is copied; otherwise
+                a fresh screenshot is taken.
 
         Returns:
             Dict with saved file paths: {"screenshot": path_or_None, "ui_dump": path_or_None}
@@ -865,11 +873,15 @@ If any key elements are missing or the description doesn't match, set result to 
 
         if screenshot:
             try:
-                tmp_path = "/tmp/debug_screenshot.png"
-                self.screenshot(tmp_path)
                 dest = os.path.join(output_dir, f"{test_name}_{step_name}_{timestamp}.png")
-                shutil.copy(tmp_path, dest)
-                print(f"Saved screenshot to: {dest}")
+                if existing_screenshot and os.path.exists(existing_screenshot):
+                    shutil.copy(existing_screenshot, dest)
+                    print(f"Saved screenshot to: {dest} (copied from {existing_screenshot})")
+                else:
+                    tmp_path = "/tmp/debug_screenshot.png"
+                    self.screenshot(tmp_path)
+                    shutil.copy(tmp_path, dest)
+                    print(f"Saved screenshot to: {dest}")
                 result["screenshot"] = dest
             except Exception as e:
                 print(f"Failed to save screenshot: {e}")
@@ -997,7 +1009,7 @@ Look for elements with matching text, content_desc, or context. The bounds field
                 )
 
                 # Parse response
-                response_text = message.content[0].text.strip()
+                response_text = next(b.text for b in message.content if b.type == "text").strip()
 
                 # Strip markdown code blocks if present
                 if response_text.startswith("```"):
