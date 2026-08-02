@@ -1,6 +1,6 @@
-# version 2.1.2
+# version 2.2.0
 
-* Default model is now "claude-sonnet-4-6" (the old default "claude-sonnet-4-20250514" was retired and returns a 404). Pass `model=` to override.
+* When `model` is not passed, the default assertion model is now resolved dynamically: `SCREEN_AGENT_MODEL` env override -> newest Sonnet via the Anthropic Models API -> `claude-sonnet-4-6` fallback (offline / API failure). Replaces the retired hard-coded `claude-sonnet-4-20250514`, which returned a 404. The lookup is cached per process, so the Models API is queried at most once. Pass `model=` to force a specific model.
 * Parse screenshot-validation responses by selecting the text content block instead of assuming `content[0]` — adaptive-thinking models (e.g. Claude Sonnet 4.6+/5) can return a thinking block first, which broke `content[0].text`.
 
 # version 2.0.0

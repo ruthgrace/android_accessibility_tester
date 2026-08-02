@@ -97,19 +97,52 @@ class ElementCoordinates:
 class AndroidAccessibilityTester:
     """Main class for Android accessibility testing with screenshot assertions."""
 
+    # Model used for screenshot assertions when the caller doesn't pass one explicitly.
+    # Resolution priority (see _resolve_default_model): SCREEN_AGENT_MODEL env override ->
+    # newest Sonnet via the Anthropic Models API -> this pinned fallback (offline / API failure).
+    DEFAULT_MODEL_FALLBACK = "claude-sonnet-4-6"
+    _resolved_default_model = None  # cached across instances so the Models API is queried once
+
     def __init__(self, device_id: Optional[str] = None, model: Optional[str] = None, api_key: Optional[str] = None):
         """
         Initialize the tester.
 
         Args:
             device_id: Specific Android device ID. If None, uses the first available device.
-            model: Claude model to use for assertions. If None, defaults to "claude-sonnet-4-6".
+            model: Claude model to use for assertions. If None, resolves the newest Sonnet via the
+                Anthropic Models API (override with the SCREEN_AGENT_MODEL env var; falls back to
+                "claude-sonnet-4-6" if the API can't be reached).
             api_key: Anthropic API key. If None, uses ANTHROPIC_API_KEY environment variable.
         """
         self.device_id = device_id
-        self.default_model = model or "claude-sonnet-4-6"
         self.client = Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+        self.default_model = model or self._resolve_default_model()
         self._verify_adb()
+
+    def _resolve_default_model(self) -> str:
+        """Resolve the default assertion model when the caller passes model=None.
+
+        Priority: SCREEN_AGENT_MODEL env override -> newest Sonnet via the Models API ->
+        pinned fallback. The result is cached on the class so the Models API is hit at most once
+        per process, even though a fresh tester is created for every test.
+        """
+        if AndroidAccessibilityTester._resolved_default_model:
+            return AndroidAccessibilityTester._resolved_default_model
+
+        resolved = os.environ.get("SCREEN_AGENT_MODEL")
+        if resolved:
+            print(f"📌 android_accessibility_tester: model from SCREEN_AGENT_MODEL: {resolved}")
+        else:
+            try:
+                sonnets = [m for m in self.client.models.list() if "sonnet" in m.id.lower()]
+                resolved = max(sonnets, key=lambda m: m.created_at).id
+                print(f"🔎 android_accessibility_tester: resolved newest Sonnet: {resolved}")
+            except Exception as e:
+                resolved = self.DEFAULT_MODEL_FALLBACK
+                print(f"⚠️  android_accessibility_tester: Models API lookup failed ({e}); using {resolved}")
+
+        AndroidAccessibilityTester._resolved_default_model = resolved
+        return resolved
 
     def _verify_adb(self):
         """Verify ADB is installed and accessible."""
