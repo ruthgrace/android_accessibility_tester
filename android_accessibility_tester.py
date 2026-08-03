@@ -12,9 +12,11 @@ import json
 import re
 import time
 import tempfile
+import threading
 import xml.etree.ElementTree as ET
 from typing import Optional, List, Tuple
 from functools import wraps
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_validator
 from anthropic import Anthropic
 from anthropic import APITimeoutError, APIConnectionError, RateLimitError, InternalServerError
 try:
@@ -38,60 +40,478 @@ def timing(f):
     return wrap
 
 
-class ValidationResult:
-    """Result of a screenshot validation."""
+TRANSIENT_API_ERRORS = (RateLimitError, InternalServerError, APITimeoutError, APIConnectionError)
+RETRY_DELAYS = [1, 2, 4, 8]  # exponential backoff, plus one final attempt
+MAX_SCHEMA_ATTEMPTS = 2
 
-    def __init__(self, result: bool, error: Optional[str] = None):
-        """
-        Initialize validation result.
+TOOL_NAME = "record_result"
 
-        Args:
-            result: Whether the validation passed
-            error: Error message if validation failed, None otherwise
-        """
-        self.result = result
-        self.error = error
+
+class StructuredCallError(RuntimeError):
+    """The model could not produce output matching the requested schema."""
+
+
+def structured_call(client, model: str, content, output_model, max_tokens: int = 1024):
+    """Call Claude and return a validated instance of `output_model`.
+
+    Uses forced tool use so the response is JSON conforming to the model's schema —
+    no prose parsing. Transient API errors are retried with exponential backoff;
+    responses that violate the schema are retried by showing the model its own
+    validation errors.
+
+    Args:
+        client: An Anthropic client.
+        model: Model id to call.
+        content: A prompt string, or a list of content blocks (e.g. image + text).
+        output_model: A pydantic BaseModel subclass describing the expected output.
+        max_tokens: Token ceiling for the response.
+
+    Returns:
+        An instance of `output_model`.
+
+    Raises:
+        StructuredCallError: The model never produced schema-conforming output.
+    """
+    tool = {
+        "name": TOOL_NAME,
+        "description": (output_model.__doc__ or "Record the result.").strip(),
+        "input_schema": output_model.model_json_schema(),
+    }
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+
+    messages = [{"role": "user", "content": content}]
+    api_attempt = 0
+    schema_attempts = 0
+
+    while True:
+        try:
+            message = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                tools=[tool],
+                tool_choice={"type": "tool", "name": TOOL_NAME},
+                messages=messages,
+            )
+        except TRANSIENT_API_ERRORS as e:
+            if api_attempt >= len(RETRY_DELAYS):
+                raise
+            delay = RETRY_DELAYS[api_attempt]
+            print(f"API error on attempt {api_attempt + 1}: {type(e).__name__}. Retrying in {delay}s...")
+            time.sleep(delay)
+            api_attempt += 1
+            continue
+
+        block = next(b for b in message.content if b.type == "tool_use")
+        try:
+            return output_model.model_validate(block.input)
+        except ValidationError as e:
+            schema_attempts += 1
+            if schema_attempts >= MAX_SCHEMA_ATTEMPTS:
+                raise StructuredCallError(
+                    f"{output_model.__name__} validation failed after {schema_attempts} attempts: {e}"
+                ) from e
+            messages = messages + [
+                {"role": "assistant", "content": message.content},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "is_error": True,
+                            "content": f"Validation failed:\n{e}\nCall the tool again with corrected values.",
+                        }
+                    ],
+                },
+            ]
+
+
+class Result(BaseModel):
+    """Base for outcome-carrying returns. Truthy on success; .error explains failure."""
+
+    ok: bool
+    error: Optional[str] = None
 
     def __bool__(self):
-        """Allow using the result directly in assertions."""
-        return self.result
+        return self.ok
 
     def __repr__(self):
-        """String representation of the result."""
-        if self.result:
-            return "ValidationResult(result=True)"
-        return f"ValidationResult(result=False, error={self.error!r})"
+        if self.ok:
+            return f"{type(self).__name__}(ok=True)"
+        return f"{type(self).__name__}(ok=False): {self.error}"
+
+    __str__ = __repr__
 
 
-class ElementCoordinates:
-    """Coordinates of an element found on screen."""
+BOUNDS_RE = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
 
-    def __init__(self, x1: int, y1: int, x2: int, y2: int, method: str, confidence: Optional[str] = None):
-        """
-        Initialize element coordinates.
 
-        Args:
-            x1: Top-left x coordinate
-            y1: Top-left y coordinate
-            x2: Bottom-right x coordinate
-            y2: Bottom-right y coordinate
-            method: Method used to find coordinates ("accessibility" or "visual")
-            confidence: Optional confidence/explanation from the method
-        """
-        self.x1 = x1
-        self.y1 = y1
-        self.x2 = x2
-        self.y2 = y2
-        self.method = method
-        self.confidence = confidence
+class Check(Result):
+    """Whether the screen matches the expected description."""
+
+    ok: bool = Field(description="True only if ALL described elements are present and accurate.")
+    error: Optional[str] = Field(
+        default=None,
+        description=(
+            "If ok is false, one sentence naming what is wrong or missing. "
+            "Null if ok is true."
+        ),
+    )
+    # Filled in locally after the call — never part of the schema the model sees.
+    _screenshot: Optional[str] = PrivateAttr(default=None)
+
+    @property
+    def screenshot(self) -> Optional[str]:
+        """Path to the screenshot this check ran against, if it was kept."""
+        return self._screenshot
+
+    def __repr__(self):
+        return Result.__repr__(self)
+
+    __str__ = __repr__
+
+
+class Element(BaseModel):
+    """The location of a UI element within the accessibility hierarchy."""
+
+    found: bool = Field(description="Whether an element matching the description was found.")
+    bounds: Optional[str] = Field(
+        default=None,
+        description='Copied EXACTLY from the hierarchy, in the form "[x1,y1][x2,y2]". Required when found is true.',
+    )
+    explanation: str = Field(description="One sentence on why this element matches, or why none does.")
+    resource_id: Optional[str] = Field(default=None, description="The matched element's resource_id, if it has one.")
+    content_desc: Optional[str] = Field(default=None, description="The matched element's content_desc, if it has one.")
+    text: Optional[str] = Field(default=None, description="The matched element's text, if it has any.")
+
+    @model_validator(mode="after")
+    def _check_bounds(self):
+        if self.found and not self.bounds:
+            raise ValueError("bounds is required when found is true")
+        if self.bounds and not BOUNDS_RE.fullmatch(self.bounds):
+            raise ValueError(f'bounds must match "[x1,y1][x2,y2]", got {self.bounds!r}')
+        return self
+
+    def box(self) -> Tuple[int, int, int, int]:
+        """Return (x1, y1, x2, y2)."""
+        return tuple(int(g) for g in BOUNDS_RE.fullmatch(self.bounds).groups())
 
     def center(self) -> Tuple[int, int]:
-        """Get the center point of the element."""
-        return ((self.x1 + self.x2) // 2, (self.y1 + self.y2) // 2)
+        """Return the center point of the element as (x, y)."""
+        x1, y1, x2, y2 = self.box()
+        return ((x1 + x2) // 2, (y1 + y2) // 2)
 
     def __repr__(self):
-        """String representation of the coordinates."""
-        return f"ElementCoordinates(({self.x1}, {self.y1}), ({self.x2}, {self.y2}), method={self.method!r})"
+        if not self.found:
+            return f"Element(found=False): {self.explanation}"
+        return f"Element({self.bounds}, resource_id={self.resource_id!r})"
+
+
+class ActResult(Result):
+    """Outcome of an act() — carries the element that was acted on."""
+
+    element: Optional[Element] = None
+
+
+class PixelResult(Result):
+    """Outcome of waiting on a pixel."""
+
+    initial_color: Optional[str] = None
+    final_color: Optional[str] = None
+
+
+class LogcatResult(Result):
+    """Outcome of waiting on a logcat line."""
+
+    line: Optional[str] = None
+
+
+def _to_rgb(color) -> Tuple[int, int, int]:
+    """Accept '#rrggbb' or an (r, g, b) tuple and return an RGB tuple."""
+    if isinstance(color, str):
+        color = color.lstrip("#")
+        return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+    return tuple(color)
+
+
+def _to_hex(rgb) -> str:
+    """Format an RGB tuple as '#rrggbb'."""
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
+class Tick:
+    """One poll cycle. Captures the screen at most once, however many conditions ask."""
+
+    def __init__(self, tester):
+        self.tester = tester
+        self._screenshot = None
+
+    def screenshot(self) -> str:
+        """Path to this cycle's screenshot, captured lazily and shared across conditions."""
+        if self._screenshot is None:
+            fd, path = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            self.tester.screenshot(path)
+            self._screenshot = path
+        return self._screenshot
+
+    def pixel(self, x: int, y: int) -> Tuple[int, int, int]:
+        """RGB of a pixel on this cycle's screenshot."""
+        return self.tester._get_pixel_color(self.screenshot(), x, y)
+
+    def hierarchy(self) -> str:
+        """This cycle's UI hierarchy XML."""
+        return self.tester._get_ui_hierarchy()
+
+    def release(self):
+        """Delete this cycle's screenshot, if one was taken."""
+        if self._screenshot and os.path.exists(self._screenshot):
+            os.unlink(self._screenshot)
+        self._screenshot = None
+
+
+class Condition:
+    """Something wait_for() can poll for.
+
+    Subclasses implement poll() and describe(). start()/stop() are for conditions
+    that need a live resource (see Logcat).
+    """
+
+    def start(self, tester):
+        """Set up before the first poll."""
+
+    def stop(self, tester):
+        """Tear down after the last poll."""
+
+    def poll(self, tick) -> Optional[Result]:
+        """Return a truthy Result once satisfied, else None."""
+        raise NotImplementedError
+
+    def timeout(self, tick, seconds: float) -> Result:
+        """Build the failure Result for a condition that never came true."""
+        return Result(ok=False, error=f"Timeout after {seconds}s - {self.describe()}")
+
+    def describe(self) -> str:
+        """One phrase naming what was awaited, used in timeout errors."""
+        raise NotImplementedError
+
+
+class PixelColor(Condition):
+    """Wait for a pixel to become one of the given colors (or, with exclude, any other).
+
+    Example:
+        tester.wait_for(PixelColor(300, 1380, ["#fffad0", "#d2cea4"]), timeout=30)
+        tester.wait_for(PixelColor(300, 1380, "#ffffff", exclude=True))
+    """
+
+    def __init__(self, x: int, y: int, colors, exclude: bool = False):
+        self.x, self.y = x, y
+        raw = colors if isinstance(colors, list) else [colors]
+        self.targets = [_to_rgb(c) for c in raw]
+        self.exclude = exclude
+        self.initial = None
+
+    def _satisfied(self, rgb) -> bool:
+        hit = any(rgb == t for t in self.targets)
+        return not hit if self.exclude else hit
+
+    def poll(self, tick):
+        rgb = tick.pixel(self.x, self.y)
+        if self.initial is None:
+            self.initial = _to_hex(rgb)
+        if self._satisfied(rgb):
+            return PixelResult(ok=True, initial_color=self.initial, final_color=_to_hex(rgb))
+        return None
+
+    def timeout(self, tick, seconds):
+        final = _to_hex(tick.pixel(self.x, self.y))
+        return PixelResult(
+            ok=False,
+            initial_color=self.initial,
+            final_color=final,
+            error=f"Timeout after {seconds}s - pixel at ({self.x}, {self.y}) is {final}, expected {self.describe()}",
+        )
+
+    def describe(self) -> str:
+        wanted = ", ".join(_to_hex(t) for t in self.targets)
+        return f"anything except {wanted}" if self.exclude else wanted
+
+
+class PixelChanged(Condition):
+    """Wait for a pixel to become any color other than the one it started as.
+
+    Example:
+        tester.wait_for(PixelChanged(500, 300), timeout=5)
+    """
+
+    def __init__(self, x: int, y: int):
+        self.x, self.y = x, y
+        self.initial_rgb = None
+
+    def poll(self, tick):
+        rgb = tick.pixel(self.x, self.y)
+        if self.initial_rgb is None:
+            self.initial_rgb = rgb
+            return None
+        if rgb != self.initial_rgb:
+            return PixelResult(ok=True, initial_color=_to_hex(self.initial_rgb), final_color=_to_hex(rgb))
+        return None
+
+    def timeout(self, tick, seconds):
+        initial = _to_hex(self.initial_rgb) if self.initial_rgb else None
+        return PixelResult(
+            ok=False,
+            initial_color=initial,
+            final_color=initial,
+            error=f"Timeout after {seconds}s - pixel at ({self.x}, {self.y}) remained {initial}",
+        )
+
+    def describe(self) -> str:
+        return f"pixel at ({self.x}, {self.y}) to change"
+
+
+class _ElementCondition(Condition):
+    """Shared matching for ElementPresent / ElementGone."""
+
+    def __init__(self, text=None, resource_id=None, content_desc=None):
+        if not any([text, resource_id, content_desc]):
+            raise ValueError("Provide at least one of text, resource_id or content_desc")
+        self.text = text
+        self.resource_id = resource_id
+        self.content_desc = content_desc
+
+    def _present(self, tick) -> bool:
+        root = ET.fromstring(tick.hierarchy())
+        for node in root.iter():
+            if self.text and node.get("text") == self.text:
+                return True
+            if self.content_desc and node.get("content-desc") == self.content_desc:
+                return True
+            if self.resource_id:
+                rid = node.get("resource-id") or ""
+                if rid == self.resource_id or rid.split("/")[-1] == self.resource_id:
+                    return True
+        return False
+
+    def describe(self) -> str:
+        parts = [f"{k}={v!r}" for k, v in (
+            ("text", self.text), ("resource_id", self.resource_id), ("content_desc", self.content_desc)
+        ) if v]
+        return f"element {' '.join(parts)}"
+
+
+class ElementPresent(_ElementCondition):
+    """Wait for an element to appear in the accessibility hierarchy.
+
+    Example:
+        assert tester.wait_for(ElementPresent(resource_id="start_button"), timeout=5)
+    """
+
+    def poll(self, tick):
+        return Result(ok=True) if self._present(tick) else None
+
+    def describe(self) -> str:
+        return f"{super().describe()} to appear"
+
+
+class ElementGone(_ElementCondition):
+    """Wait for an element to disappear from the accessibility hierarchy.
+
+    Example:
+        assert tester.wait_for(ElementGone(resource_id="loading_spinner"), timeout=30)
+    """
+
+    def poll(self, tick):
+        return Result(ok=True) if not self._present(tick) else None
+
+    def describe(self) -> str:
+        return f"{super().describe()} to disappear"
+
+
+class Logcat(Condition):
+    """Wait for a logcat line under `tag` containing `message`.
+
+    Example:
+        tester.wait_for(Logcat("MessageDraftOverlay", "created"), timeout=30)
+    """
+
+    def __init__(self, tag: str, message: str, clear_first: bool = True):
+        self.tag = tag
+        self.message = message
+        self.clear_first = clear_first
+        self._proc = None
+        self._matched = [None]
+
+    def start(self, tester):
+        adb_cmd = tester._get_adb_command()
+        if self.clear_first:
+            subprocess.run(adb_cmd + ["logcat", "-c"], capture_output=True)
+        self._proc = subprocess.Popen(
+            adb_cmd + ["logcat", "-v", "brief", f"{self.tag}:D", "*:S"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+        )
+
+        def reader():
+            for line in self._proc.stdout:
+                if self.message in line:
+                    self._matched[0] = line.strip()
+                    return
+
+        threading.Thread(target=reader, daemon=True).start()
+
+    def poll(self, tick):
+        if self._matched[0] is not None:
+            return LogcatResult(ok=True, line=self._matched[0])
+        return None
+
+    def timeout(self, tick, seconds):
+        return LogcatResult(ok=False, error=f"Timeout after {seconds}s - {self.describe()}")
+
+    def stop(self, tester):
+        if self._proc:
+            self._proc.terminate()
+            self._proc.wait()
+            self._proc = None
+
+    def describe(self) -> str:
+        return f'never saw "{self.message}" in tag {self.tag}'
+
+
+class AnyOf(Condition):
+    """Wait for whichever of several conditions is satisfied first.
+
+    All branches share one screenshot and one hierarchy dump per poll.
+
+    Example:
+        tester.wait_for(AnyOf(Logcat("Overlay", "created"), PixelChanged(300, 1380)))
+    """
+
+    def __init__(self, *conditions):
+        if not conditions:
+            raise ValueError("AnyOf needs at least one condition")
+        self.conditions = conditions
+
+    def start(self, tester):
+        for c in self.conditions:
+            c.start(tester)
+
+    def stop(self, tester):
+        for c in self.conditions:
+            c.stop(tester)
+
+    def poll(self, tick):
+        for c in self.conditions:
+            result = c.poll(tick)
+            if result:
+                return result
+        return None
+
+    def timeout(self, tick, seconds):
+        return Result(ok=False, error=f"Timeout after {seconds}s - none of: {self.describe()}")
+
+    def describe(self) -> str:
+        return "; ".join(c.describe() for c in self.conditions)
 
 
 class AndroidAccessibilityTester:
@@ -199,111 +619,168 @@ class AndroidAccessibilityTester:
 
         return output_path
 
-    @timing
-    def validate_screenshot(self, screenshot_path: str, description: str,
-                           model: Optional[str] = None) -> ValidationResult:
-        """
-        Validate that a screenshot matches the given description using Claude LLM.
+    def _structured_call(self, content, output_model, model=None, max_tokens=1024):
+        """Call Claude for a schema-validated result using this tester's client and model."""
+        return structured_call(
+            self.client, model or self.default_model, content, output_model, max_tokens=max_tokens
+        )
 
-        Args:
-            screenshot_path: Path to the screenshot file
-            description: Description of what should be visible in the screenshot
-            model: Claude model to use for validation. If None, uses the default model from initialization.
-
-        Returns:
-            ValidationResult object with .result (bool) and .error (str or None)
-        """
-        if model is None:
-            model = self.default_model
-        # Read and encode the screenshot
+    def _image_block(self, screenshot_path: str) -> dict:
+        """Read a screenshot into a base64 image content block."""
         with open(screenshot_path, "rb") as f:
             image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+        return {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": image_data},
+        }
 
-        # Create prompt for Claude
-        prompt = f"""You are analyzing a screenshot from an Android application accessibility test.
+    def _hierarchy_json(self, max_depth: int = 5) -> str:
+        """Dump the UI hierarchy and simplify it into JSON for the model."""
+        root = ET.fromstring(self._get_ui_hierarchy())
+        return json.dumps(self._simplify_node_for_llm(root, max_depth=max_depth), indent=2)
 
-Description of what should be in the screenshot:
-{description}
+    @timing
+    def check(self, description: str, screenshot_path: Optional[str] = None,
+              model: Optional[str] = None) -> Check:
+        """Check that the current screen matches a described expectation.
 
-Based on the screenshot, does it match this description?
-Respond with ONLY a JSON object in this exact format:
-{{"result": true, "error_message": null}}
-or
-{{"result": false, "error_message": "description of what is wrong or missing"}}
+        Captures a screenshot itself. When the check passes and no explicit path was
+        requested, the screenshot is discarded; when it fails, the file is kept and
+        exposed as `.screenshot` so the failure can be inspected.
 
-If ALL the key elements described are present and the description is completely accurate, set result to true and error_message to null.
-If any key elements are missing or the description doesn't match, set result to false and provide a clear error_message explaining what is wrong."""
+        Args:
+            description: What should be on screen. Be specific — the check only passes
+                if ALL described elements are present.
+            screenshot_path: Where to save the screenshot. If None, a temp file is used
+                and kept only on failure.
+            model: Claude model override. Defaults to this tester's model.
 
-        # Call Claude API with exponential backoff retry
-        retry_delays = [1, 2, 4, 8]  # Exponential backoff in seconds
-        last_error = None
+        Returns:
+            Check — truthy when the screen matches; `.error` holds one sentence explaining
+            the mismatch otherwise.
 
-        for attempt, delay in enumerate(retry_delays + [None]):  # +[None] for one final attempt
-            try:
-                message = self.client.messages.create(
-                    model=model,
-                    max_tokens=200,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": "image/png",
-                                        "data": image_data,
-                                    },
-                                },
-                                {
-                                    "type": "text",
-                                    "text": prompt
-                                }
-                            ],
-                        }
-                    ],
-                )
+        Example:
+            assert tester.check("the clock app is showing with an Alarms tab at the bottom")
+        """
+        keep = screenshot_path is not None
+        path = screenshot_path
+        if path is None:
+            fd, path = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
 
-                # Parse response
-                response_text = next(b.text for b in message.content if b.type == "text").strip()
+        self.screenshot(path)
+        result = self._structured_call(
+            [
+                self._image_block(path),
+                {
+                    "type": "text",
+                    "text": (
+                        "You are analyzing a screenshot from an Android application "
+                        "accessibility test.\n\nDescription of what should be in the "
+                        f"screenshot:\n{description}\n\nDoes the screenshot match? Set ok "
+                        "to true only if ALL key elements described are present and the "
+                        "description is completely accurate."
+                    ),
+                },
+            ],
+            Check,
+            model=model,
+            max_tokens=300,
+        )
 
-                # Strip markdown code blocks if present
-                if response_text.startswith("```"):
-                    # Remove opening ```json or ```
-                    lines = response_text.split("\n")
-                    if lines[0].startswith("```"):
-                        lines = lines[1:]
-                    # Remove closing ```
-                    if lines and lines[-1].strip() == "```":
-                        lines = lines[:-1]
-                    response_text = "\n".join(lines).strip()
+        if keep or not result.ok:
+            result._screenshot = path
+        else:
+            os.unlink(path)
+        return result
 
-                try:
-                    response_data = json.loads(response_text)
-                except json.JSONDecodeError:
-                    # LLM sometimes adds explanatory text before/after JSON - extract it
-                    json_match = re.search(r'\{[^{}]*"result"\s*:\s*(true|false)[^{}]*\}', response_text)
-                    if json_match:
-                        response_data = json.loads(json_match.group())
-                    else:
-                        raise ValueError(f"Could not extract JSON from response: {response_text[:200]}...")
-                return ValidationResult(
-                    result=response_data["result"],
-                    error=response_data.get("error_message")
-                )
+    @timing
+    def extract(self, description: str, schema, model: Optional[str] = None):
+        """Extract structured data from the current screen into `schema`.
 
-            except (RateLimitError, InternalServerError, APITimeoutError, APIConnectionError) as e:
-                last_error = e
-                # If this was the last attempt, raise the error
-                if delay is None:
-                    break
+        Sends both a screenshot and the accessibility hierarchy, so the model can read
+        values that appear in either.
 
-                # Log retry attempt
-                print(f"API error on attempt {attempt + 1}: {type(e).__name__}. Retrying in {delay}s...")
-                time.sleep(delay)
+        Args:
+            description: What to extract, in natural language.
+            schema: A pydantic BaseModel subclass describing the shape you want back.
+            model: Claude model override. Defaults to this tester's model.
 
-        # If we exhausted all retries, raise the last error
-        raise last_error
+        Returns:
+            An instance of `schema`.
+
+        Example:
+            class TimerState(BaseModel):
+                '''The state of the on-screen timer.'''
+                remaining_seconds: int
+                is_running: bool
+
+            state = tester.extract("the state of the running timer", TimerState)
+            assert state.remaining_seconds > 0
+        """
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            self.screenshot(path)
+            return self._structured_call(
+                [
+                    self._image_block(path),
+                    {
+                        "type": "text",
+                        "text": (
+                            "You are reading data off an Android screen. Extract the "
+                            f"following:\n{description}\n\nUse both the screenshot above and "
+                            "this accessibility hierarchy:\n"
+                            f"{self._hierarchy_json()}"
+                        ),
+                    },
+                ],
+                schema,
+                model=model,
+                max_tokens=1024,
+            )
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    @timing
+    def observe(self, description: str, model: Optional[str] = None) -> Optional[Element]:
+        """Locate an element in the accessibility hierarchy, without acting on it.
+
+        The returned Element carries selectors (resource_id, content_desc, text) as well
+        as bounds, so it can be cached by the caller and replayed later without another
+        model call.
+
+        Args:
+            description: Description of the element to find.
+            model: Claude model override. Defaults to this tester's model.
+
+        Returns:
+            Element if found, None otherwise.
+
+        Example:
+            start = tester.observe("the Start Timer button")
+            if start:
+                tester.tap(*start.center())
+        """
+        element = self._observe_element(description, model=model)
+        return element if element.found else None
+
+    def _observe_element(self, description: str, model: Optional[str] = None) -> Element:
+        """Locate an element, keeping the model's explanation even when nothing matched."""
+        return self._structured_call(
+            (
+                "You are analyzing an Android UI accessibility hierarchy to find a "
+                f"specific element.\n\nElement description: {description}\n\n"
+                f"UI Hierarchy (simplified JSON):\n{self._hierarchy_json()}\n\n"
+                "Find the element that best matches the description. Copy its bounds "
+                "EXACTLY from the hierarchy."
+            ),
+            Element,
+            model=model,
+            max_tokens=400,
+        )
+
 
     def list_devices(self) -> List[str]:
         """
@@ -418,392 +895,113 @@ If any key elements are missing or the description doesn't match, set result to 
             rgb_img = img.convert('RGB')
             return rgb_img.getpixel((x, y))
 
-    def wait_for_pixel_change(self, x: int, y: int, timeout: float = 10.0,
-                              poll_interval: float = 0.5) -> dict:
-        """
-        Wait for a pixel at the given coordinates to change color.
+    def resolve(self, element: Element) -> Optional[Element]:
+        """Re-find a previously observed element in the current hierarchy, without the model.
 
-        This is useful for detecting when UI elements appear/disappear or change state
-        without requiring accessibility services or UI hierarchy parsing.
+        Matches on the element's selectors (resource_id, then content_desc, then text) and
+        returns it with fresh bounds, so a cached element still taps the right place after a
+        layout shift. Returns None if no selector matches — the caller can then fall back to
+        observe().
 
         Args:
-            x: X coordinate of the pixel to monitor
-            y: Y coordinate of the pixel to monitor
-            timeout: Maximum time to wait in seconds (default: 10.0)
-            poll_interval: Time between checks in seconds (default: 0.5)
+            element: An Element from a previous observe().
 
         Returns:
-            Dictionary with:
-                - 'changed': bool - Whether the pixel changed
-                - 'initial_color': str - Hex color code of initial pixel (e.g., '#FF0000')
-                - 'final_color': str - Hex color code of final pixel if changed
-                - 'error': str - Error message if timeout occurred
-
-        Example:
-            # Wait for a pixel to change (e.g., loading indicator)
-            result = tester.wait_for_pixel_change(500, 300, timeout=5.0)
-            if result['changed']:
-                print(f"Color changed from {result['initial_color']} to {result['final_color']}")
-            else:
-                print(f"Timeout: {result['error']}")
+            The same element with current bounds, or None if it is no longer on screen.
         """
-        if Image is None:
-            raise RuntimeError("PIL/Pillow is required for pixel operations. Install with: pip install Pillow")
-
-        # Take initial screenshot
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            initial_screenshot = tmp.name
-
-        try:
-            self.screenshot(initial_screenshot)
-            initial_color = self._get_pixel_color(initial_screenshot, x, y)
-            initial_hex = f"#{initial_color[0]:02x}{initial_color[1]:02x}{initial_color[2]:02x}"
-
-            start_time = time.time()
-
-            while time.time() - start_time < timeout:
-                time.sleep(poll_interval)
-
-                # Take new screenshot
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                    current_screenshot = tmp.name
-
-                try:
-                    self.screenshot(current_screenshot)
-                    current_color = self._get_pixel_color(current_screenshot, x, y)
-
-                    # Check if color changed
-                    if current_color != initial_color:
-                        final_hex = f"#{current_color[0]:02x}{current_color[1]:02x}{current_color[2]:02x}"
-                        return {
-                            'changed': True,
-                            'initial_color': initial_hex,
-                            'final_color': final_hex,
-                            'error': None
-                        }
-                finally:
-                    # Clean up current screenshot
-                    if os.path.exists(current_screenshot):
-                        os.unlink(current_screenshot)
-
-            # Timeout occurred
-            return {
-                'changed': False,
-                'initial_color': initial_hex,
-                'final_color': None,
-                'error': f'Timeout after {timeout}s - pixel at ({x}, {y}) remained {initial_hex}'
-            }
-
-        finally:
-            # Clean up initial screenshot
-            if os.path.exists(initial_screenshot):
-                os.unlink(initial_screenshot)
+        root = ET.fromstring(self._get_ui_hierarchy())
+        for node in root.iter():
+            rid = node.get("resource-id") or ""
+            matched = (
+                (element.resource_id and (rid == element.resource_id
+                                          or rid.split("/")[-1] == element.resource_id))
+                or (element.content_desc and node.get("content-desc") == element.content_desc)
+                or (element.text and node.get("text") == element.text)
+            )
+            if matched and node.get("bounds"):
+                return element.model_copy(update={"bounds": node.get("bounds")})
+        return None
 
     @timing
-    def wait_for_pixel_color(self, x: int, y: int, target_color,
-                              timeout: float = 10.0, poll_interval: float = 0.5,
-                              exclude: bool = False) -> dict:
-        """
-        Wait for a pixel at the given coordinates to become a specific color or one of multiple acceptable colors.
-        With exclude=True, waits for the pixel to become any color OTHER than the specified colors.
+    def act(self, target, model: Optional[str] = None) -> ActResult:
+        """Tap an element, described in natural language or replayed from a cached Element.
 
-        This is useful for waiting for UI elements to reach a specific state
-        (e.g., button turning green when enabled, or overlay appearing in light/dark mode).
+        Given a string, the element is located with observe() — one model call. Given an
+        Element from an earlier observe(), it is re-resolved against the current hierarchy
+        with no model call at all, falling back to observe() only if its selectors are gone.
 
         Args:
-            x: X coordinate of the pixel to monitor
-            y: Y coordinate of the pixel to monitor
-            target_color: Target color as:
-                - Single hex string (e.g., '#FF0000')
-                - Single RGB tuple (255, 0, 0)
-                - List of hex strings (e.g., ['#FF0000', '#00FF00'])
-                - List of RGB tuples (e.g., [(255, 0, 0), (0, 255, 0)])
-            timeout: Maximum time to wait in seconds (default: 10.0)
-            poll_interval: Time between checks in seconds (default: 0.5)
-            exclude: If True, wait for the pixel to NOT be any of the target colors (default: False)
+            target: A natural-language description, or an Element to replay.
+            model: Claude model override, used only when the model is consulted.
 
         Returns:
-            Dictionary with:
-                - 'matched': bool - Whether the condition was met (color matched, or excluded colors avoided)
-                - 'initial_color': str - Hex color code of initial pixel
-                - 'final_color': str - Hex color code of final pixel
-                - 'target_color': str or list - Hex color code(s) of target color(s)
-                - 'matched_color': str - Which target color was matched (if matched and not exclude mode)
-                - 'error': str - Error message if timeout occurred
+            ActResult — truthy on success, with `.element` holding what was tapped.
 
         Example:
-            # Wait for a button to turn green
-            result = tester.wait_for_pixel_color(500, 300, '#00FF00', timeout=5.0)
+            assert tester.act("tap the Start Timer button")
 
-            # Wait for overlay to appear in either light or dark mode
-            result = tester.wait_for_pixel_color(300, 1380, ['#fffad0', '#d2cea4'], timeout=30.0)
-            if result['matched']:
-                print(f"Pixel matched {result['matched_color']}")
-
-            # Wait for pixel to become any color OTHER than the background colors
-            result = tester.wait_for_pixel_color(300, 1380, ['#ffffff', '#1b1b1b'], exclude=True, timeout=30.0)
+            start = tester.observe("the Start Timer button")   # once
+            for _ in range(10):
+                tester.act(start)                              # no model calls
         """
-        if Image is None:
-            raise RuntimeError("PIL/Pillow is required for pixel operations. Install with: pip install Pillow")
-
-        # Convert target_color(s) to list of RGB tuples
-        def to_rgb(color):
-            if isinstance(color, str):
-                # Remove '#' if present
-                color = color.lstrip('#')
-                # Convert hex to RGB
-                return tuple(int(color[i:i+2], 16) for i in (0, 2, 4))
-            else:
-                return tuple(color)
-
-        # Handle both single color and list of colors
-        if isinstance(target_color, list):
-            target_rgb_list = [to_rgb(c) for c in target_color]
-            target_hex_list = [f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}" for rgb in target_rgb_list]
-            target_hex = target_hex_list  # For return value
+        if isinstance(target, Element):
+            element = self.resolve(target) or self._observe_element(target.explanation, model=model)
+            description = target.explanation
         else:
-            target_rgb_list = [to_rgb(target_color)]
-            target_hex_list = [f"#{target_rgb_list[0][0]:02x}{target_rgb_list[0][1]:02x}{target_rgb_list[0][2]:02x}"]
-            target_hex = target_hex_list[0]  # For return value (single string for backward compatibility)
+            element = self._observe_element(target, model=model)
+            description = target
 
-        # Take initial screenshot
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            initial_screenshot = tmp.name
+        if not element.found:
+            return ActResult(
+                ok=False,
+                error=f"Could not find an element matching {description!r}: {element.explanation}",
+            )
 
-        try:
-            self.screenshot(initial_screenshot)
-            initial_color = self._get_pixel_color(initial_screenshot, x, y)
-            initial_hex = f"#{initial_color[0]:02x}{initial_color[1]:02x}{initial_color[2]:02x}"
+        self.tap(*element.center())
+        return ActResult(ok=True, element=element)
 
-            # Check if condition already met
-            if exclude:
-                # In exclude mode, check that pixel is NOT any of the target colors
-                is_excluded = any(initial_color == t for t in target_rgb_list)
-                if not is_excluded:
-                    import sys
-                    if '-v' in sys.argv or '--verbose' in sys.argv:
-                        print(f"⏱️  Pixel at ({x}, {y}) already not an excluded color (is {initial_hex})")
-                    return {
-                        'matched': True,
-                        'initial_color': initial_hex,
-                        'final_color': initial_hex,
-                        'target_color': target_hex,
-                        'matched_color': None,
-                        'error': None
-                    }
-            else:
-                for i, target_rgb in enumerate(target_rgb_list):
-                    if initial_color == target_rgb:
-                        matched_hex = target_hex_list[i]
-                        import sys
-                        if '-v' in sys.argv or '--verbose' in sys.argv:
-                            print(f"⏱️  Pixel at ({x}, {y}) already at target color {matched_hex}")
-                        return {
-                            'matched': True,
-                            'initial_color': initial_hex,
-                            'final_color': initial_hex,
-                            'target_color': target_hex,
-                            'matched_color': matched_hex,
-                            'error': None
-                        }
+    def wait_for(self, condition, timeout: float = 10.0, poll_interval: float = 0.5) -> Result:
+        """Wait for a condition to be satisfied.
 
-            import sys
-            if '-v' in sys.argv or '--verbose' in sys.argv:
-                target_display = target_hex if isinstance(target_hex, str) else f"one of {target_hex}"
-                if exclude:
-                    print(f"⏱️  Waiting for pixel at ({x}, {y}) to change from {initial_hex} to anything except {target_display}...")
-                else:
-                    print(f"⏱️  Waiting for pixel at ({x}, {y}) to change from {initial_hex} to {target_display}...")
-            start_time = time.time()
-
-            while time.time() - start_time < timeout:
-                time.sleep(poll_interval)
-
-                # Take new screenshot
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                    current_screenshot = tmp.name
-
-                try:
-                    self.screenshot(current_screenshot)
-                    current_color = self._get_pixel_color(current_screenshot, x, y)
-                    current_hex = f"#{current_color[0]:02x}{current_color[1]:02x}{current_color[2]:02x}"
-
-                    if exclude:
-                        # Check that pixel is NOT any of the excluded colors
-                        is_excluded = any(current_color == t for t in target_rgb_list)
-                        if not is_excluded:
-                            elapsed = time.time() - start_time
-                            print(f"⏱️  ✅ Pixel color is not an excluded color after {elapsed:.3f}s ({initial_hex} -> {current_hex})")
-                            return {
-                                'matched': True,
-                                'initial_color': initial_hex,
-                                'final_color': current_hex,
-                                'target_color': target_hex,
-                                'matched_color': None,
-                                'error': None
-                            }
-                    else:
-                        # Check if color matches any of the target colors
-                        for i, target_rgb in enumerate(target_rgb_list):
-                            if current_color == target_rgb:
-                                elapsed = time.time() - start_time
-                                matched_hex = target_hex_list[i]
-                                print(f"⏱️  ✅ Pixel color matched after {elapsed:.3f}s ({initial_hex} -> {current_hex})")
-                                return {
-                                    'matched': True,
-                                    'initial_color': initial_hex,
-                                    'final_color': current_hex,
-                                    'target_color': target_hex,
-                                    'matched_color': matched_hex,
-                                    'error': None
-                                }
-                finally:
-                    # Clean up current screenshot
-                    if os.path.exists(current_screenshot):
-                        os.unlink(current_screenshot)
-
-            # Timeout occurred - get final color
-            elapsed = time.time() - start_time
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                final_screenshot = tmp.name
-
-            try:
-                self.screenshot(final_screenshot)
-                final_color = self._get_pixel_color(final_screenshot, x, y)
-                final_hex = f"#{final_color[0]:02x}{final_color[1]:02x}{final_color[2]:02x}"
-            finally:
-                if os.path.exists(final_screenshot):
-                    os.unlink(final_screenshot)
-
-            # Check if the final color meets condition (race condition: might have changed after timeout)
-            if exclude:
-                is_excluded = any(final_color == t for t in target_rgb_list)
-                if not is_excluded:
-                    print(f"⏱️  ✅ Pixel color is not an excluded color after {elapsed:.3f}s ({initial_hex} -> {final_hex}) [detected on timeout]")
-                    return {
-                        'matched': True,
-                        'initial_color': initial_hex,
-                        'final_color': final_hex,
-                        'target_color': target_hex,
-                        'matched_color': None,
-                        'error': None
-                    }
-            else:
-                for i, target_rgb in enumerate(target_rgb_list):
-                    if final_color == target_rgb:
-                        matched_hex = target_hex_list[i]
-                        print(f"⏱️  ✅ Pixel color matched after {elapsed:.3f}s ({initial_hex} -> {final_hex}) [detected on timeout]")
-                        return {
-                            'matched': True,
-                            'initial_color': initial_hex,
-                            'final_color': final_hex,
-                            'target_color': target_hex,
-                            'matched_color': matched_hex,
-                            'error': None
-                        }
-
-            target_display = target_hex if isinstance(target_hex, str) else ', '.join(target_hex)
-            if exclude:
-                print(f"⏱️  ❌ Timeout after {elapsed:.3f}s - pixel at ({x}, {y}) is {final_hex}, expected anything except {target_display}")
-                return {
-                    'matched': False,
-                    'initial_color': initial_hex,
-                    'final_color': final_hex,
-                    'target_color': target_hex,
-                    'matched_color': None,
-                    'error': f'Timeout after {timeout}s - pixel at ({x}, {y}) is {final_hex}, expected anything except {target_display}'
-                }
-            else:
-                print(f"⏱️  ❌ Timeout after {elapsed:.3f}s - pixel at ({x}, {y}) is {final_hex}, expected {target_display}")
-                return {
-                    'matched': False,
-                    'initial_color': initial_hex,
-                    'final_color': final_hex,
-                    'target_color': target_hex,
-                    'matched_color': None,
-                    'error': f'Timeout after {timeout}s - pixel at ({x}, {y}) is {final_hex}, expected {target_display}'
-                }
-
-        finally:
-            # Clean up initial screenshot
-            if os.path.exists(initial_screenshot):
-                os.unlink(initial_screenshot)
-
-    def wait_for_logcat(self, tag: str, message: str, timeout: float = 30.0,
-                        clear_first: bool = True) -> dict:
-        """
-        Wait for a specific logcat message to appear.
-
-        Monitors logcat for a log line matching the given tag and message substring.
-        This is useful for waiting on app-internal events like overlay creation,
-        service starts, or state changes without relying on UI pixel colors.
+        Polls until the condition comes true or `timeout` elapses. The condition is
+        checked once before the first sleep, so an already-satisfied condition returns
+        immediately. Each poll captures the screen at most once, no matter how many
+        conditions look at it.
 
         Args:
-            tag: Logcat tag to filter on (e.g., 'MessageDraftOverlay')
-            message: Substring to search for in the log message
-            timeout: Maximum time to wait in seconds (default: 30.0)
-            clear_first: If True, clears logcat before waiting to avoid matching old entries (default: True)
+            condition: A Condition — PixelColor, PixelChanged, ElementPresent,
+                ElementGone, Logcat, or AnyOf(...) of those.
+            timeout: Maximum time to wait, in seconds.
+            poll_interval: Time between polls, in seconds.
 
         Returns:
-            Dictionary with:
-                - 'matched': bool - Whether the log message was found
-                - 'line': str - The full matching log line (if matched)
-                - 'error': str - Error message if timeout occurred
+            Result — truthy when satisfied; `.error` explains the timeout otherwise.
+            Pixel and logcat conditions return richer subclasses (PixelResult,
+            LogcatResult) carrying their diagnostics.
+
+        Example:
+            assert tester.wait_for(ElementGone(resource_id="loading_spinner"), timeout=30)
+
+            result = tester.wait_for(PixelColor(300, 1380, ["#fffad0", "#d2cea4"]))
+            assert result, result.error
         """
-        adb_cmd = self._get_adb_command()
-
-        if clear_first:
-            subprocess.run(adb_cmd + ["logcat", "-c"], capture_output=True)
-
-        # Start logcat filtered by tag
-        proc = subprocess.Popen(
-            adb_cmd + ["logcat", "-v", "brief", f"{tag}:D", "*:S"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1  # Line-buffered for reliable readline
-        )
-
-        import sys
-        if '-v' in sys.argv or '--verbose' in sys.argv:
-            print(f"⏱️  Waiting for logcat tag={tag} message containing '{message}'...")
-
-        start_time = time.time()
+        condition.start(self)
+        started = time.time()
         try:
-            import threading
-
-            matched_line = [None]
-
-            def reader():
-                for line in proc.stdout:
-                    if message in line:
-                        matched_line[0] = line.strip()
-                        return
-
-            reader_thread = threading.Thread(target=reader, daemon=True)
-            reader_thread.start()
-
-            while time.time() - start_time < timeout:
-                reader_thread.join(timeout=0.5)
-                if matched_line[0] is not None:
-                    elapsed = time.time() - start_time
-                    print(f"⏱️  ✅ Logcat matched after {elapsed:.3f}s: {matched_line[0]}")
-                    return {
-                        'matched': True,
-                        'line': matched_line[0],
-                        'error': None
-                    }
-
-            elapsed = time.time() - start_time
-            print(f"⏱️  ❌ Logcat timeout after {elapsed:.3f}s - never saw '{message}' in tag {tag}")
-            return {
-                'matched': False,
-                'line': None,
-                'error': f'Timeout after {timeout}s - never saw "{message}" in tag {tag}'
-            }
+            while True:
+                tick = Tick(self)
+                try:
+                    result = condition.poll(tick)
+                    if result:
+                        return result
+                    if time.time() - started >= timeout:
+                        return condition.timeout(tick, timeout)
+                finally:
+                    tick.release()
+                time.sleep(poll_interval)
         finally:
-            proc.terminate()
-            proc.wait()
+            condition.stop(self)
+
 
     def _get_ui_hierarchy(self) -> str:
         """
@@ -828,50 +1026,6 @@ If any key elements are missing or the description doesn't match, set result to 
         with open(local_path, "r") as f:
             return f.read()
 
-    def check_element_exists(self, content_desc: Optional[str] = None,
-                             text: Optional[str] = None,
-                             wait_after_dump: float = 0.5) -> bool:
-        """Check if an element exists in the UI hierarchy.
-
-        Runs uiautomator dump, pulls XML, and searches for matching attributes.
-        If wait_after_dump > 0, waits that long and re-dumps to account for
-        accessibility service reconnection after uiautomator disconnects it.
-
-        Args:
-            content_desc: Content description to search for (exact match)
-            text: Text content to search for (exact match)
-            wait_after_dump: Seconds to wait and re-dump after initial dump (default 0.5)
-
-        Returns:
-            True if a matching element was found, False otherwise
-        """
-        try:
-            device_path = "/sdcard/ui_hierarchy_check.xml"
-            self.shell(f"uiautomator dump {device_path}")
-
-            if wait_after_dump > 0:
-                time.sleep(wait_after_dump)
-                self.shell(f"uiautomator dump {device_path}")
-
-            local_path = "/tmp/ui_hierarchy_check.xml"
-            cmd = self._get_adb_command() + ["pull", device_path, local_path]
-            subprocess.run(cmd, capture_output=True, check=True)
-
-            with open(local_path, 'r') as f:
-                xml_content = f.read()
-            root = ET.fromstring(xml_content)
-
-            for node in root.iter():
-                if content_desc and node.get('content-desc') == content_desc:
-                    return True
-                if text and node.get('text') == text:
-                    return True
-
-            return False
-        except Exception as e:
-            print(f"Error checking UI hierarchy: {e}")
-            return False
-
     def save_debug_artifacts(self, output_dir: str, test_name: str, step_name: str,
                              screenshot: bool = True, ui_dump: bool = True,
                              existing_screenshot: Optional[str] = None) -> dict:
@@ -881,7 +1035,7 @@ If any key elements are missing or the description doesn't match, set result to 
         post-mortem debugging. If `existing_screenshot` is provided and readable,
         that file is copied instead of capturing a new one — use this when the
         failure was detected against a specific screenshot (e.g. a
-        validate_screenshot failure) so the saved artifact matches what the
+        check() failure) so the saved artifact matches what the
         validator actually saw. Otherwise a fresh screenshot is captured.
 
         Args:
@@ -937,21 +1091,6 @@ If any key elements are missing or the description doesn't match, set result to 
 
         return result
 
-    def _parse_bounds(self, bounds_str: str) -> Tuple[int, int, int, int]:
-        """
-        Parse bounds string from UI hierarchy XML.
-
-        Args:
-            bounds_str: Bounds string in format "[x1,y1][x2,y2]"
-
-        Returns:
-            Tuple of (x1, y1, x2, y2)
-        """
-        # Remove brackets and split
-        bounds_str = bounds_str.replace("][", ",").replace("[", "").replace("]", "")
-        coords = [int(x) for x in bounds_str.split(",")]
-        return tuple(coords)
-
     def _simplify_node_for_llm(self, node: ET.Element, max_depth: int = 3, current_depth: int = 0) -> dict:
         """
         Simplify an XML node into a dict for LLM consumption.
@@ -980,100 +1119,14 @@ If any key elements are missing or the description doesn't match, set result to 
         # Add children if not at max depth
         if current_depth < max_depth:
             children = [self._simplify_node_for_llm(child, max_depth, current_depth + 1) for child in node]
-            # Only include children if they have meaningful content
-            children = [c for c in children if c.get("text") or c.get("content_desc") or c.get("clickable")]
+            # Keep children with meaningful content — and plain containers whose own
+            # descendants are meaningful, so nesting doesn't drop a subtree.
+            children = [
+                c for c in children
+                if c.get("text") or c.get("content_desc") or c.get("clickable") or c.get("children")
+            ]
             if children:
                 result["children"] = children
 
         return result
 
-    def find_element_coordinates_accessibility(self, description: str,
-                                               model: Optional[str] = None) -> Optional[ElementCoordinates]:
-        """
-        Find element coordinates using accessibility hierarchy (Approach 4).
-
-        Args:
-            description: Description of the element to find
-            model: Claude model to use. If None, uses the default model from initialization.
-
-        Returns:
-            ElementCoordinates object if found, None if not found
-        """
-        if model is None:
-            model = self.default_model
-
-        # Get UI hierarchy
-        xml_content = self._get_ui_hierarchy()
-        root = ET.fromstring(xml_content)
-
-        # Simplify the hierarchy for LLM
-        simplified_tree = self._simplify_node_for_llm(root, max_depth=5)
-
-        # Create prompt for Claude
-        prompt = f"""You are analyzing an Android UI accessibility hierarchy to find a specific element.
-
-Element description: {description}
-
-UI Hierarchy (simplified JSON):
-{json.dumps(simplified_tree, indent=2)}
-
-Find the element that best matches the description. Respond with ONLY a JSON object in this exact format:
-{{"found": true, "bounds": "[x1,y1][x2,y2]", "explanation": "why this element matches"}}
-or
-{{"found": false, "explanation": "why no element matches"}}
-
-Look for elements with matching text, content_desc, or context. The bounds field should be copied EXACTLY from the hierarchy."""
-
-        # Call Claude API with exponential backoff retry
-        retry_delays = [1, 2, 4, 8]
-        last_error = None
-
-        for attempt, delay in enumerate(retry_delays + [None]):
-            try:
-                message = self.client.messages.create(
-                    model=model,
-                    max_tokens=300,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ],
-                )
-
-                # Parse response
-                response_text = next(b.text for b in message.content if b.type == "text").strip()
-
-                # Strip markdown code blocks if present
-                if response_text.startswith("```"):
-                    # Remove opening ```json or ```
-                    lines = response_text.split("\n")
-                    if lines[0].startswith("```"):
-                        lines = lines[1:]
-                    # Remove closing ```
-                    if lines and lines[-1].strip() == "```":
-                        lines = lines[:-1]
-                    response_text = "\n".join(lines).strip()
-
-                response_data = json.loads(response_text)
-
-                if response_data.get("found"):
-                    bounds = response_data["bounds"]
-                    x1, y1, x2, y2 = self._parse_bounds(bounds)
-                    return ElementCoordinates(
-                        x1=x1, y1=y1, x2=x2, y2=y2,
-                        method="accessibility",
-                        confidence=response_data.get("explanation")
-                    )
-                else:
-                    return None
-
-            except (RateLimitError, InternalServerError, APITimeoutError, APIConnectionError) as e:
-                last_error = e
-                if delay is None:
-                    break
-                print(f"API error on attempt {attempt + 1}: {type(e).__name__}. Retrying in {delay}s...")
-                time.sleep(delay)
-
-        # If we exhausted all retries, raise the last error
-        raise last_error

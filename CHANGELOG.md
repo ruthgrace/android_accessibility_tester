@@ -1,18 +1,24 @@
-# version 2.2.0
+# version 3.0.0
 
-* When `model` is not passed, the default assertion model is now resolved dynamically: `SCREEN_AGENT_MODEL` env override -> newest Sonnet via the Anthropic Models API -> `claude-sonnet-4-6` fallback (offline / API failure). Replaces the retired hard-coded `claude-sonnet-4-20250514`, which returned a 404. The lookup is cached per process, so the Models API is queried at most once. Pass `model=` to force a specific model.
-* Parse screenshot-validation responses by selecting the text content block instead of assuming `content[0]` — adaptive-thinking models (e.g. Claude Sonnet 4.6+/5) can return a thinking block first, which broke `content[0].text`.
+Breaking release. The API is reorganized around what you want (check / extract / observe / act / wait_for) rather than which mechanism supplies it, and every model call now uses forced tool use with a pydantic schema instead of parsing JSON out of prose.
 
-# version 2.0.0
+**New**
 
-* Add methods for waiting until a pixel changes color, or waiting until a pixel changes to a specific color
-* ADB longpress command and ADB swipe command
+* `check(description)` — replaces `validate_screenshot`. Captures the screenshot itself; keeps the file only when the check fails, exposed as `.screenshot`.
+* `extract(description, schema)` — read typed data off the screen into a pydantic model. Sends both the screenshot and the accessibility hierarchy.
+* `observe(description)` — replaces `find_element_coordinates_accessibility`. Returns an `Element` carrying selectors (`resource_id`, `content_desc`, `text`) as well as bounds, so a result can be cached.
+* `act(target)` — tap an element by natural-language description, or replay a cached `Element` with no model call. A replayed element is re-resolved against the current hierarchy, so it survives layout shifts; it falls back to the model only when its selectors are gone.
+* `resolve(element)` — re-find a cached element in the current hierarchy without the model.
+* `wait_for(condition, timeout, poll_interval)` — one verb replacing the five wait methods, taking `PixelColor`, `PixelChanged`, `ElementPresent`, `ElementGone`, `Logcat`, or `AnyOf(...)`. `AnyOf` waits for whichever fires first, which was not previously expressible. All conditions in a poll share a single screenshot and hierarchy dump.
+* `structured_call(client, model, content, output_model)` — forced-tool-use helper behind all of the above. Retries transient API errors on the existing backoff, and schema violations by returning the pydantic errors to the model as a `tool_result`.
+* Every outcome-carrying return is now a `Result` (`ok` / `error`, truthy on success), so `assert tester.wait_for(...)` reports a useful message. `PixelResult`, `LogcatResult`, `ActResult` and `Check` add their own diagnostics.
 
-# version 1.0.0
-* adjust prompt so screenshot validation only passes when it's an exact match
-* exponential backoff for claude requests
-* Return true/false plus error message for screenshot validation
+**Removed** — replaced as above: `validate_screenshot`, `find_element_coordinates_accessibility`, `wait_for_pixel_change`, `wait_for_pixel_color`, `wait_for_logcat`, `check_element_exists`, and the `ValidationResult` / `ElementCoordinates` classes.
 
-# version 0.1.0
+**Fixed**
 
-* basic screenshot validation and some ADB commands.
+* `_simplify_node_for_llm` dropped any container that was not itself clickable or texted — and its entire subtree with it, so a button nested inside a plain `FrameLayout` never reached the model. Containers whose descendants are meaningful are now kept.
+* Malformed or missing `bounds` in a model response is caught by schema validation and retried, instead of failing later inside `int()`.
+
+**Requires** pydantic >= 2.0 (already a dependency of `anthropic`) and Python >= 3.9.
+

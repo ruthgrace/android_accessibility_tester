@@ -42,14 +42,9 @@ def test_clock_app_open():
     # Open the Clock app
     tester.open_app("com.google.android.deskclock")
 
-    # Take a screenshot
-    os.makedirs("screenshots", exist_ok=True)
-    screenshot_path = "screenshots/clock_app_screenshot.png"
-    tester.screenshot(screenshot_path)
-
-    # Assert that the tabs are visible at the bottom
-    assert tester.validate_screenshot(
-        screenshot_path,
+    # Assert that the tabs are visible at the bottom. check() captures the
+    # screenshot itself and keeps it only if the assertion fails.
+    assert tester.check(
         'The screen shows a clock application with tabs at the bottom. The tabs should include "Alarms", "World Clock", "Timers", "Stopwatch", and "Bedtime".'
     )
 
@@ -61,14 +56,8 @@ def test_clock_app_fail():
     # Open the Clock app
     tester.open_app("com.google.android.deskclock")
 
-    # Take a screenshot
-    os.makedirs("screenshots", exist_ok=True)
-    screenshot_path = "screenshots/clock_app_screenshot.png"
-    tester.screenshot(screenshot_path)
-
     # Try to assert something silly that isn't there - this will fail and show the error
-    assert tester.validate_screenshot(
-        screenshot_path,
+    assert tester.check(
         'The screen shows a purple unicorn riding a skateboard in the center of the screen.'
     )
 
