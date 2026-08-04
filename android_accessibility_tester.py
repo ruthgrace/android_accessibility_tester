@@ -537,6 +537,9 @@ class AndroidAccessibilityTester:
         self.device_id = device_id
         self.client = Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
         self.default_model = model or self._resolve_default_model()
+        # The most recent check(), so failure artifacts can reuse the exact screenshot
+        # the model judged rather than a fresh capture taken after the screen moved on.
+        self.last_check = None
         self._verify_adb()
 
     def _resolve_default_model(self) -> str:
@@ -692,6 +695,7 @@ class AndroidAccessibilityTester:
             result._screenshot = path
         else:
             os.unlink(path)
+        self.last_check = result
         return result
 
     @timing
@@ -1078,18 +1082,21 @@ class AndroidAccessibilityTester:
                 device_dump_path = "/sdcard/window_dump.xml"
                 self.shell(f"uiautomator dump {device_dump_path}")
                 dest = os.path.join(output_dir, f"{test_name}_{step_name}_{timestamp}_uidump.xml")
-                cmd = self._get_adb_command() + ["pull", device_dump_path, dest]
-                pull_result = subprocess.run(cmd, capture_output=True, text=True)
-                if pull_result.returncode == 0:
-                    print(f"Saved UI dump to: {dest}")
-                    result["ui_dump"] = dest
-                    self.shell(f"rm {device_dump_path}")
-                else:
-                    print(f"Failed to pull UI dump: {pull_result.stderr}")
+                self._pull(device_dump_path, dest)
+                print(f"Saved UI dump to: {dest}")
+                result["ui_dump"] = dest
+                self.shell(f"rm {device_dump_path}")
             except Exception as e:
                 print(f"Failed to save UI dump: {e}")
 
         return result
+
+    def _pull(self, remote_path: str, local_path: str):
+        """Pull a file off the device, raising if adb fails."""
+        cmd = self._get_adb_command() + ["pull", remote_path, local_path]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"adb pull {remote_path} failed: {result.stderr.strip()}")
 
     def _simplify_node_for_llm(self, node: ET.Element, max_depth: int = 3, current_depth: int = 0) -> dict:
         """
@@ -1130,3 +1137,79 @@ class AndroidAccessibilityTester:
 
         return result
 
+
+
+DEFAULT_ARTIFACT_DIR = "test-failures"
+
+
+def capture_failure(tester, test_name: str, output_dir: Optional[str] = None,
+                    step_name: str = "failure") -> dict:
+    """Save post-mortem artifacts for a failed test: a screenshot and a hierarchy dump.
+
+    The hierarchy dump is deliberately confined to this path. `uiautomator dump` runs
+    through UiAutomation, which suppresses the accessibility services of the app under
+    test — so it must never run while a test is still executing. Once a test has failed
+    there is nothing left to disturb, and the dump is the richest diagnostic available.
+
+    If the last check() failed, its screenshot is reused, so the artifact is what the
+    model actually judged rather than a fresh capture of a screen that has since moved on.
+
+    Args:
+        tester: The AndroidAccessibilityTester used by the failing test.
+        test_name: Name of the failing test, used in the artifact filenames.
+        output_dir: Where to write artifacts. Defaults to $ANDROID_TEST_ARTIFACTS,
+            then "test-failures".
+        step_name: Label for this capture within the test.
+
+    Returns:
+        Dict of saved paths: {"screenshot": path_or_None, "ui_dump": path_or_None}
+    """
+    output_dir = output_dir or os.environ.get("ANDROID_TEST_ARTIFACTS", DEFAULT_ARTIFACT_DIR)
+    last = getattr(tester, "last_check", None)
+    return tester.save_debug_artifacts(
+        output_dir=output_dir,
+        test_name=test_name,
+        step_name=step_name,
+        existing_screenshot=last.screenshot if last else None,
+    )
+
+
+def find_tester(funcargs: dict):
+    """Return the AndroidAccessibilityTester among a test's fixtures, if there is one.
+
+    Matches by type rather than by fixture name, so the failure hook works whatever
+    the fixture is called.
+    """
+    for value in funcargs.values():
+        if isinstance(value, AndroidAccessibilityTester):
+            return value
+    return None
+
+
+def failure_artifact_hook(item, call):
+    """pytest hook body: save artifacts when a test body raises.
+
+    Wire it up from a conftest.py:
+
+        from android_accessibility_tester import failure_artifact_hook
+
+        def pytest_runtest_makereport(item, call):
+            failure_artifact_hook(item, call)
+    """
+    if call.when != "call" or call.excinfo is None:
+        return
+
+    tester = find_tester(getattr(item, "funcargs", {}) or {})
+    if tester is None:
+        return
+
+    try:
+        artifacts = capture_failure(tester, item.name)
+    except Exception as e:
+        # Never let artifact capture mask the real test failure.
+        print(f"Could not capture failure artifacts: {e}")
+        return
+
+    saved = [p for p in artifacts.values() if p]
+    if saved:
+        print("\nFailure artifacts:\n  " + "\n  ".join(saved))

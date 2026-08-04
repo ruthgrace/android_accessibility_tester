@@ -1,3 +1,11 @@
+# version 3.1.0
+
+**Automatic failure artifacts.** A pytest hook (`failure_artifact_hook`, wired up in `conftest.py`) saves a screenshot and a UI hierarchy dump when a test fails, to `$ANDROID_TEST_ARTIFACTS` (default `./test-failures`). It locates the tester by type among the test's fixtures, so the fixture can be named anything, and reuses the screenshot from a failed `check()` so the artifact is what the model actually judged. Failures while saving are printed, never raised, so they cannot mask the real failure.
+
+**Documentation correction.** The 3.0.0 notes and CLAUDE.md claimed element conditions polled the hierarchy "without requiring accessibility services, avoiding conflicts with apps that hold accessibility permissions." The second half was backwards. `uiautomator dump` runs through `UiAutomation`, which suppresses the accessibility services of the app under test; `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES` cannot be passed via `adb shell`. For a framework meant to test accessibility apps, that makes hierarchy access unsafe during a test.
+
+The governing principle is now documented: the hierarchy is a post-mortem tool, never an input to control flow. `observe`, `act`, `resolve`, `extract` and the `ElementPresent`/`ElementGone` conditions currently read it and are marked disruptive pending rework onto screenshots. `check`, the pixel and logcat conditions, and the ADB primitives are unaffected.
+
 # version 3.0.0
 
 Breaking release. The API is reorganized around what you want (check / extract / observe / act / wait_for) rather than which mechanism supplies it, and every model call now uses forced tool use with a pydantic schema instead of parsing JSON out of prose.

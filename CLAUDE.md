@@ -137,7 +137,52 @@ assert tester.wait_for(AnyOf(Logcat("Overlay", "created"), PixelChanged(300, 138
 
 `ElementPresent` / `ElementGone` require at least one of `text`, `resource_id`, `content_desc`, or raise `ValueError`.
 
-Element conditions use `uiautomator dump` to poll the UI hierarchy without requiring accessibility services, avoiding conflicts with apps that hold accessibility permissions.
+**These two conditions read the UI hierarchy — see the constraint below before using them.**
+
+## The Accessibility Service Constraint
+
+This framework exists to test apps that hold accessibility permissions. `uiautomator dump`
+works *against* that goal: it runs through `UiAutomation`, which **suppresses the accessibility
+services of the app under test**. The `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES` flag exists
+but is only settable from instrumentation code — `adb shell uiautomator dump` cannot pass it.
+Reports indicate the services are destroyed rather than paused: they still read as enabled in
+Settings but need a disable/re-enable cycle to actually return.
+
+**The principle: the hierarchy is a post-mortem tool, never an input to control flow.**
+Nothing a test does while running should depend on a dump.
+
+Which methods currently read the hierarchy:
+
+| Reads the hierarchy (disruptive) | Screenshot / ADB only (safe) |
+|---|---|
+| `observe()`, `act("...")` | `check()` |
+| `extract()` | `wait_for(PixelColor / PixelChanged / Logcat)` |
+| `resolve()`, `act(element)` | `tap`, `swipe`, `input_text`, `press_key`, `shell`, `screenshot` |
+| `wait_for(ElementPresent / ElementGone)` | |
+
+The left column is slated to be reworked onto screenshots. Until then, treat those methods as
+disruptive to the app under test and prefer the right column.
+
+### Failure Artifacts
+
+The one safe place for a dump is after a test has already failed — there is nothing left to
+disturb, and it is the richest diagnostic available. `conftest.py` wires this up:
+
+```python
+from android_accessibility_tester import failure_artifact_hook
+
+def pytest_runtest_makereport(item, call):
+    failure_artifact_hook(item, call)
+```
+
+On failure this saves a screenshot and a hierarchy dump to `$ANDROID_TEST_ARTIFACTS`
+(default `./test-failures`), naming them after the test. It finds the tester by type among the
+test's fixtures, so the fixture can be called anything. If the last `check()` failed, its
+screenshot is reused, so the artifact is what the model actually judged rather than a fresh
+capture of a screen that has since moved on. Artifact capture never masks the real failure —
+errors while saving are printed and swallowed.
+
+Copy `conftest.py` into your own suite to get the same behaviour.
 
 ## Device Control
 
