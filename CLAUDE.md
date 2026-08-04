@@ -109,7 +109,9 @@ for _ in range(10):
 
 **resolve(element) → Element | None**
 
-Re-finds a cached element in the current hierarchy without the model, returning it with fresh bounds. Returns None if no selector matches.
+Re-finds a cached element in the current view tree without the model, returning it with fresh
+bounds. Matches on `resource_id` only — an element observed without one cannot be replayed and
+falls back to the model.
 
 ## Waiting
 
@@ -123,8 +125,8 @@ Conditions:
 |---|---|
 | `PixelColor(x, y, colors, exclude=False)` | Pixel to become one of `colors` (a hex string, RGB tuple, or list). With `exclude=True`, any color *other* than those. |
 | `PixelChanged(x, y)` | Pixel to become any color other than its starting one |
-| `ElementPresent(text=, resource_id=, content_desc=)` | Element to appear. `resource_id` matches short or full form. |
-| `ElementGone(text=, resource_id=, content_desc=)` | Element to disappear |
+| `ElementPresent(resource_id=)` | Element to appear. Matches short or fully-qualified id. |
+| `ElementGone(resource_id=)` | Element to disappear |
 | `Logcat(tag, message, clear_first=True)` | A logcat line under `tag` containing `message` |
 | `AnyOf(*conditions)` | Whichever fires first |
 
@@ -135,38 +137,75 @@ assert tester.wait_for(ElementGone(resource_id="loading_spinner"), timeout=30)
 assert tester.wait_for(AnyOf(Logcat("Overlay", "created"), PixelChanged(300, 1380)))
 ```
 
-`ElementPresent` / `ElementGone` require at least one of `text`, `resource_id`, `content_desc`, or raise `ValueError`.
-
-**These two conditions read the UI hierarchy — see the constraint below before using them.**
+`ElementPresent` / `ElementGone` require a `resource_id`. Passing `text` or `content_desc`
+raises `ValueError`: matching on those would need `uiautomator dump`. They read the view tree
+via `dumpsys activity top`, so they cost no model calls and do not disturb the app.
 
 ## The Accessibility Service Constraint
 
-This framework exists to test apps that hold accessibility permissions. `uiautomator dump`
-works *against* that goal: it runs through `UiAutomation`, which **suppresses the accessibility
-services of the app under test**. The `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES` flag exists
-but is only settable from instrumentation code — `adb shell uiautomator dump` cannot pass it.
-Reports indicate the services are destroyed rather than paused: they still read as enabled in
-Settings but need a disable/re-enable cycle to actually return.
+This framework exists to test apps that hold accessibility permissions, so nothing on the
+happy path may disturb them.
 
-**The principle: the hierarchy is a post-mortem tool, never an input to control flow.**
-Nothing a test does while running should depend on a dump.
+`uiautomator dump` does exactly that. It runs through `UiAutomation`, which **suppresses the
+accessibility services of the app under test**. `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES`
+exists but is only settable from instrumentation code — `adb shell uiautomator dump` cannot
+pass it. Reports indicate the services are destroyed rather than paused: still enabled in
+Settings, but needing a disable/re-enable cycle to return.
 
-Which methods currently read the hierarchy:
+**So the framework reads structure with `dumpsys activity top` instead.** That goes through
+ActivityManager and never touches `UiAutomation`, so it leaves the app's services alone.
 
-| Reads the hierarchy (disruptive) | Screenshot / ADB only (safe) |
-|---|---|
-| `observe()`, `act("...")` | `check()` |
-| `extract()` | `wait_for(PixelColor / PixelChanged / Logcat)` |
-| `resolve()`, `act(element)` | `tap`, `swipe`, `input_text`, `press_key`, `shell`, `screenshot` |
-| `wait_for(ElementPresent / ElementGone)` | |
+`uiautomator dump` now appears in exactly one place: `save_debug_artifacts`, on the failure
+path, where the test is already over and there is nothing left to disturb.
 
-The left column is slated to be reworked onto screenshots. Until then, treat those methods as
-disruptive to the app under test and prefer the right column.
+### What each source gives you
+
+| | `dumpsys activity top` | screenshot | `uiautomator dump` |
+|---|---|---|---|
+| Disturbs the app | no | no | **yes** |
+| resource ids | yes | no | yes |
+| bounds | yes (parent-relative, resolved to absolute here) | no | yes (absolute) |
+| clickable / enabled / visible | yes | no | yes |
+| **text and content descriptions** | **no** | yes (visually) | yes |
+| Used on the happy path | yes | yes | never |
+
+The missing text is why `observe()` and `extract()` send **both** a screenshot and the view
+tree: the screenshot shows what each control says, the tree supplies exact bounds and ids.
+
+Because there is no text, element conditions and `resolve()` match on `resource_id` only.
+`ElementPresent(text=...)` raises `ValueError` explaining why rather than silently reaching
+for a disruptive dump.
+
+`dumpsys activity top` output is a debugging dump, not a stable API — its format can shift
+between Android versions. `parse_view_tree` is where that risk is concentrated.
+
+## Capturing State
+
+**capture(screenshot=True, views=True) → Capture**
+
+A free snapshot of the current screen — no model call, and nothing that disturbs the app.
+Both sources are captured by default. Call it purely to establish a baseline and ignore the
+result, or hold it and compare later.
+
+```python
+before = tester.capture()
+tester.act("tap the send button")
+after = tester.capture()
+
+assert after.find("message_row") is not None
+before.release()   # deletes the screenshot file
+```
+
+`Capture` has `.screenshot` (path or None), `.views` (list of `ViewNode`), `.find(resource_id)`
+and `.release()`.
+
+`ViewNode` carries `.cls`, `.resource_id`, `.full_resource_id`, `.bounds` (absolute),
+`.visible`, `.enabled`, `.clickable`, `.children`, plus `.box()`, `.center()` and `.walk()`.
 
 ### Failure Artifacts
 
-The one safe place for a dump is after a test has already failed — there is nothing left to
-disturb, and it is the richest diagnostic available. `conftest.py` wires this up:
+The one safe place for a `uiautomator` dump is after a test has already failed. `conftest.py`
+wires this up:
 
 ```python
 from android_accessibility_tester import failure_artifact_hook
@@ -175,12 +214,12 @@ def pytest_runtest_makereport(item, call):
     failure_artifact_hook(item, call)
 ```
 
-On failure this saves a screenshot and a hierarchy dump to `$ANDROID_TEST_ARTIFACTS`
-(default `./test-failures`), naming them after the test. It finds the tester by type among the
+On failure this saves a screenshot and a full hierarchy dump to `$ANDROID_TEST_ARTIFACTS`
+(default `./test-failures`), named after the test. It finds the tester by type among the
 test's fixtures, so the fixture can be called anything. If the last `check()` failed, its
 screenshot is reused, so the artifact is what the model actually judged rather than a fresh
-capture of a screen that has since moved on. Artifact capture never masks the real failure —
-errors while saving are printed and swallowed.
+capture of a screen that has since moved on. Errors while saving are printed and swallowed,
+so artifact capture can never mask the real failure.
 
 Copy `conftest.py` into your own suite to get the same behaviour.
 
@@ -212,7 +251,7 @@ export ANTHROPIC_API_KEY=your_api_key_here
 Unit tests for the framework itself need no device or API key:
 
 ```bash
-./venv/bin/pytest test_structured.py test_wait.py test_act.py
+./venv/bin/pytest test_structured.py test_wait.py test_act.py test_viewtree.py test_failure_artifacts.py
 ```
 
 ## Example Test Structure
@@ -252,9 +291,12 @@ Note that pydantic's default lax mode coerces some values — `"yes"`, `"on"` an
 
 `input_text()` handles ADB requirements: spaces become `%s`, and `()` are escaped.
 
-### UI Hierarchy Simplification
+### View Tree Simplification
 
-The hierarchy is simplified before being sent to Claude to reduce token usage: only meaningful attributes (text, content_desc, resource_id, bounds, clickable, enabled), class names truncated from package names, max depth 5. Containers are kept when their descendants are meaningful, so nesting doesn't drop a subtree.
+`dumpsys` output is parsed by `parse_view_tree` into `ViewNode` trees, accumulating each
+node's parent-relative bounds into absolute screen coordinates. Before being sent to Claude
+it is reduced to class name, resource id, bounds and the clickable/enabled flags, with
+invisible subtrees dropped.
 
 ### Screenshot Workflow
 

@@ -13,7 +13,6 @@ import re
 import time
 import tempfile
 import threading
-import xml.etree.ElementTree as ET
 from typing import Optional, List, Tuple
 from functools import wraps
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_validator
@@ -246,6 +245,7 @@ class Tick:
     def __init__(self, tester):
         self.tester = tester
         self._screenshot = None
+        self._views = None
 
     def screenshot(self) -> str:
         """Path to this cycle's screenshot, captured lazily and shared across conditions."""
@@ -260,15 +260,18 @@ class Tick:
         """RGB of a pixel on this cycle's screenshot."""
         return self.tester._get_pixel_color(self.screenshot(), x, y)
 
-    def hierarchy(self) -> str:
-        """This cycle's UI hierarchy XML."""
-        return self.tester._get_ui_hierarchy()
+    def views(self) -> List["ViewNode"]:
+        """This cycle's view tree, parsed once and shared across conditions."""
+        if self._views is None:
+            self._views = self.tester._get_view_tree()
+        return self._views
 
     def release(self):
         """Delete this cycle's screenshot, if one was taken."""
         if self._screenshot and os.path.exists(self._screenshot):
             os.unlink(self._screenshot)
         self._screenshot = None
+        self._views = None
 
 
 class Condition:
@@ -374,31 +377,23 @@ class PixelChanged(Condition):
 class _ElementCondition(Condition):
     """Shared matching for ElementPresent / ElementGone."""
 
-    def __init__(self, text=None, resource_id=None, content_desc=None):
-        if not any([text, resource_id, content_desc]):
-            raise ValueError("Provide at least one of text, resource_id or content_desc")
-        self.text = text
+    def __init__(self, resource_id=None, text=None, content_desc=None):
+        if text or content_desc:
+            raise ValueError(
+                "Element conditions match on resource_id only. Matching on text or "
+                "content_desc would require `uiautomator dump`, which suppresses the "
+                "accessibility services of the app under test. Use resource_id, a pixel "
+                "condition, or check() for anything about what the screen says."
+            )
+        if not resource_id:
+            raise ValueError("Provide a resource_id")
         self.resource_id = resource_id
-        self.content_desc = content_desc
 
     def _present(self, tick) -> bool:
-        root = ET.fromstring(tick.hierarchy())
-        for node in root.iter():
-            if self.text and node.get("text") == self.text:
-                return True
-            if self.content_desc and node.get("content-desc") == self.content_desc:
-                return True
-            if self.resource_id:
-                rid = node.get("resource-id") or ""
-                if rid == self.resource_id or rid.split("/")[-1] == self.resource_id:
-                    return True
-        return False
+        return find_view(tick.views(), self.resource_id) is not None
 
     def describe(self) -> str:
-        parts = [f"{k}={v!r}" for k, v in (
-            ("text", self.text), ("resource_id", self.resource_id), ("content_desc", self.content_desc)
-        ) if v]
-        return f"element {' '.join(parts)}"
+        return f"element resource_id={self.resource_id!r}"
 
 
 class ElementPresent(_ElementCondition):
@@ -637,10 +632,26 @@ class AndroidAccessibilityTester:
             "source": {"type": "base64", "media_type": "image/png", "data": image_data},
         }
 
-    def _hierarchy_json(self, max_depth: int = 5) -> str:
-        """Dump the UI hierarchy and simplify it into JSON for the model."""
-        root = ET.fromstring(self._get_ui_hierarchy())
-        return json.dumps(self._simplify_node_for_llm(root, max_depth=max_depth), indent=2)
+    def _view_tree_json(self) -> str:
+        """Serialize the `dumpsys` view tree as JSON for the model.
+
+        Carries ids, absolute bounds and flags but no text — the screenshot supplies
+        anything about what the screen actually says.
+        """
+        def simplify(node):
+            out = {"class": node.cls.split(".")[-1], "bounds": list(node.bounds)}
+            if node.resource_id:
+                out["resource_id"] = node.resource_id
+            if node.clickable:
+                out["clickable"] = True
+            if not node.enabled:
+                out["enabled"] = False
+            kids = [simplify(c) for c in node.children if c.visible]
+            if kids:
+                out["children"] = kids
+            return out
+
+        return json.dumps([simplify(r) for r in self._get_view_tree()], indent=2)
 
     @timing
     def check(self, description: str, screenshot_path: Optional[str] = None,
@@ -733,9 +744,10 @@ class AndroidAccessibilityTester:
                         "type": "text",
                         "text": (
                             "You are reading data off an Android screen. Extract the "
-                            f"following:\n{description}\n\nUse both the screenshot above and "
-                            "this accessibility hierarchy:\n"
-                            f"{self._hierarchy_json()}"
+                            f"following:\n{description}\n\nUse the screenshot above for "
+                            "anything the screen says, and this view tree for structure "
+                            "(it carries ids and bounds but no text):\n"
+                            f"{self._view_tree_json()}"
                         ),
                     },
                 ],
@@ -771,19 +783,41 @@ class AndroidAccessibilityTester:
         return element if element.found else None
 
     def _observe_element(self, description: str, model: Optional[str] = None) -> Element:
-        """Locate an element, keeping the model's explanation even when nothing matched."""
-        return self._structured_call(
-            (
-                "You are analyzing an Android UI accessibility hierarchy to find a "
-                f"specific element.\n\nElement description: {description}\n\n"
-                f"UI Hierarchy (simplified JSON):\n{self._hierarchy_json()}\n\n"
-                "Find the element that best matches the description. Copy its bounds "
-                "EXACTLY from the hierarchy."
-            ),
-            Element,
-            model=model,
-            max_tokens=400,
-        )
+        """Locate an element, keeping the model's explanation even when nothing matched.
+
+        Sends a screenshot together with the `dumpsys` view tree: the screenshot shows
+        what each control says, the tree supplies exact bounds and resource ids. Neither
+        source disturbs the accessibility services of the app under test.
+        """
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            self.screenshot(path)
+            return self._structured_call(
+                [
+                    self._image_block(path),
+                    {
+                        "type": "text",
+                        "text": (
+                            "Find a specific element on this Android screen.\n\n"
+                            f"Element description: {description}\n\n"
+                            "The screenshot above shows what each control says. This view "
+                            "tree gives exact bounds and resource ids, but carries no text:\n"
+                            f"{self._view_tree_json()}\n\n"
+                            "Identify the element that best matches the description. Prefer "
+                            "bounds and resource_id copied EXACTLY from the view tree; fall "
+                            "back to bounds read off the screenshot if the tree has no "
+                            "matching node."
+                        ),
+                    },
+                ],
+                Element,
+                model=model,
+                max_tokens=500,
+            )
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
 
 
     def list_devices(self) -> List[str]:
@@ -899,6 +933,41 @@ class AndroidAccessibilityTester:
             rgb_img = img.convert('RGB')
             return rgb_img.getpixel((x, y))
 
+    def _get_view_tree(self) -> List["ViewNode"]:
+        """Read the view tree via `dumpsys activity top`.
+
+        Unlike `uiautomator dump` this goes through ActivityManager, so it does not
+        suppress the accessibility services of the app under test. It carries no text —
+        use a screenshot for anything about what the screen says.
+        """
+        return parse_view_tree(self.shell("dumpsys activity top"))
+
+    def capture(self, screenshot: bool = True, views: bool = True) -> "Capture":
+        """Capture the current screen state, for comparison against a later capture.
+
+        Costs no model calls and does not disturb the app under test. Call it purely to
+        establish a baseline and ignore the result, or hold it and compare later.
+
+        Args:
+            screenshot: Capture a screenshot. The caller owns the file; call
+                `capture.release()` to delete it.
+            views: Capture the view tree via `dumpsys activity top`.
+
+        Returns:
+            Capture, with `.screenshot` (path or None) and `.views` (list of ViewNode).
+
+        Example:
+            before = tester.capture()
+            tester.act("tap the send button")
+            after = tester.capture()
+        """
+        path = None
+        if screenshot:
+            fd, path = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            self.screenshot(path)
+        return Capture(screenshot=path, views=self._get_view_tree() if views else [])
+
     def resolve(self, element: Element) -> Optional[Element]:
         """Re-find a previously observed element in the current hierarchy, without the model.
 
@@ -913,18 +982,13 @@ class AndroidAccessibilityTester:
         Returns:
             The same element with current bounds, or None if it is no longer on screen.
         """
-        root = ET.fromstring(self._get_ui_hierarchy())
-        for node in root.iter():
-            rid = node.get("resource-id") or ""
-            matched = (
-                (element.resource_id and (rid == element.resource_id
-                                          or rid.split("/")[-1] == element.resource_id))
-                or (element.content_desc and node.get("content-desc") == element.content_desc)
-                or (element.text and node.get("text") == element.text)
-            )
-            if matched and node.get("bounds"):
-                return element.model_copy(update={"bounds": node.get("bounds")})
-        return None
+        if not element.resource_id:
+            return None
+        node = find_view(self._get_view_tree(), element.resource_id)
+        if node is None:
+            return None
+        x1, y1, x2, y2 = node.bounds
+        return element.model_copy(update={"bounds": f"[{x1},{y1}][{x2},{y2}]"})
 
     @timing
     def act(self, target, model: Optional[str] = None) -> ActResult:
@@ -1007,29 +1071,6 @@ class AndroidAccessibilityTester:
             condition.stop(self)
 
 
-    def _get_ui_hierarchy(self) -> str:
-        """
-        Get the UI hierarchy XML from the device.
-
-        Returns:
-            XML string of the UI hierarchy
-        """
-        # Dump UI hierarchy to device
-        device_path = "/sdcard/ui_hierarchy.xml"
-        self.shell(f"uiautomator dump {device_path}")
-
-        # Pull XML to local machine
-        local_path = "/tmp/ui_hierarchy.xml"
-        cmd = self._get_adb_command() + ["pull", device_path, local_path]
-        subprocess.run(cmd, capture_output=True, check=True)
-
-        # Clean up device file
-        self.shell(f"rm {device_path}")
-
-        # Read XML content
-        with open(local_path, "r") as f:
-            return f.read()
-
     def save_debug_artifacts(self, output_dir: str, test_name: str, step_name: str,
                              screenshot: bool = True, ui_dump: bool = True,
                              existing_screenshot: Optional[str] = None) -> dict:
@@ -1098,45 +1139,175 @@ class AndroidAccessibilityTester:
         if result.returncode != 0:
             raise RuntimeError(f"adb pull {remote_path} failed: {result.stderr.strip()}")
 
-    def _simplify_node_for_llm(self, node: ET.Element, max_depth: int = 3, current_depth: int = 0) -> dict:
-        """
-        Simplify an XML node into a dict for LLM consumption.
+# A line inside a "View Hierarchy:" block, e.g.
+#   android.widget.Button{aa11bb2 VFE...CL. ......ID 100,200-300,280 #7f0a0999 app:id/start_button}
+VIEW_LINE_RE = re.compile(
+    r"^(?P<indent>\s*)(?P<cls>[\w$.]+)\{(?P<hash>[0-9a-f]+)\s+"
+    r"(?P<flags>[\w.]{9})\s+(?P<flags2>[\w.]{8})\s+"
+    r"(?P<left>-?\d+),(?P<top>-?\d+)-(?P<right>-?\d+),(?P<bottom>-?\d+)"
+    r"(?P<rest>[^}]*)\}"
+)
+# The trailing "#7f0a0999 app:id/start_button" — the name is optional.
+VIEW_ID_RE = re.compile(r"#[0-9a-f]+\s+(?P<full>[\w.]+:id/(?P<short>[\w.]+))")
 
-        Args:
-            node: XML element node
-            max_depth: Maximum depth to traverse
-            current_depth: Current traversal depth
+# Positions within the 9-character flag group, e.g. "VFE...CL."
+FLAG_VISIBILITY = 0
+FLAG_ENABLED = 2
+FLAG_CLICKABLE = 6
+FLAG_LONG_CLICKABLE = 7
 
-        Returns:
-            Simplified dict representation
-        """
-        result = {
-            "class": node.get("class", "").split(".")[-1],  # Just the class name, not full package
-            "text": node.get("text", ""),
-            "content_desc": node.get("content-desc", ""),
-            "resource_id": node.get("resource-id", "").split("/")[-1] if node.get("resource-id") else "",
-            "bounds": node.get("bounds", ""),
-            "clickable": node.get("clickable") == "true",
-            "enabled": node.get("enabled") == "true",
-        }
 
-        # Only include non-empty fields
-        result = {k: v for k, v in result.items() if v or k == "bounds"}
+class ViewNode(BaseModel):
+    """A view from `dumpsys activity top`, with bounds resolved to screen coordinates.
 
-        # Add children if not at max depth
-        if current_depth < max_depth:
-            children = [self._simplify_node_for_llm(child, max_depth, current_depth + 1) for child in node]
-            # Keep children with meaningful content — and plain containers whose own
-            # descendants are meaningful, so nesting doesn't drop a subtree.
-            children = [
-                c for c in children
-                if c.get("text") or c.get("content_desc") or c.get("clickable") or c.get("children")
-            ]
-            if children:
-                result["children"] = children
+    No text: `dumpsys` does not print view content. Use this for structural questions
+    ("is this id present, and where?"); use a screenshot for anything about what the
+    screen says.
+    """
 
-        return result
+    cls: str
+    resource_id: Optional[str] = None
+    full_resource_id: Optional[str] = None
+    bounds: Tuple[int, int, int, int] = (0, 0, 0, 0)
+    visible: bool = True
+    enabled: bool = True
+    clickable: bool = False
+    long_clickable: bool = False
+    children: List["ViewNode"] = Field(default_factory=list)
 
+    def box(self) -> Tuple[int, int, int, int]:
+        """Return absolute (x1, y1, x2, y2)."""
+        return self.bounds
+
+    def center(self) -> Tuple[int, int]:
+        """Return the center point as (x, y)."""
+        x1, y1, x2, y2 = self.bounds
+        return ((x1 + x2) // 2, (y1 + y2) // 2)
+
+    def walk(self):
+        """Yield this node and every descendant."""
+        yield self
+        for child in self.children:
+            yield from child.walk()
+
+    def __repr__(self):
+        rid = f" #{self.resource_id}" if self.resource_id else ""
+        return f"ViewNode({self.cls.split('.')[-1]}{rid} {self.bounds})"
+
+
+def parse_view_tree(dumpsys_output: str) -> List[ViewNode]:
+    """Parse `adb shell dumpsys activity top` into one ViewNode tree per window.
+
+    `dumpsys` prints each view's bounds relative to its parent; they are accumulated
+    here so every node carries absolute screen coordinates.
+
+    Note this output is a debugging dump, not a stable API — its format can shift
+    between Android versions.
+
+    Args:
+        dumpsys_output: Raw stdout of `dumpsys activity top`.
+
+    Returns:
+        One root ViewNode per "View Hierarchy:" section, in the order printed.
+    """
+    roots: List[ViewNode] = []
+    # Stack of (indent, node, absolute_origin) for the branch currently being built.
+    stack: List[Tuple[int, ViewNode, Tuple[int, int]]] = []
+    in_hierarchy = False
+
+    for line in dumpsys_output.splitlines():
+        if not line.strip():
+            continue
+        if line.strip() == "View Hierarchy:":
+            in_hierarchy = True
+            stack = []
+            continue
+        if not in_hierarchy:
+            continue
+
+        match = VIEW_LINE_RE.match(line)
+        if not match:
+            # A non-view line at this point means the hierarchy section has ended.
+            in_hierarchy = False
+            stack = []
+            continue
+
+        indent = len(match.group("indent"))
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+
+        left, top = int(match.group("left")), int(match.group("top"))
+        right, bottom = int(match.group("right")), int(match.group("bottom"))
+        origin_x, origin_y = stack[-1][2] if stack else (0, 0)
+        bounds = (origin_x + left, origin_y + top, origin_x + right, origin_y + bottom)
+
+        flags = match.group("flags")
+        id_match = VIEW_ID_RE.search(match.group("rest"))
+        node = ViewNode(
+            cls=match.group("cls"),
+            resource_id=id_match.group("short") if id_match else None,
+            full_resource_id=id_match.group("full") if id_match else None,
+            bounds=bounds,
+            visible=flags[FLAG_VISIBILITY] == "V",
+            enabled=flags[FLAG_ENABLED] == "E",
+            clickable=flags[FLAG_CLICKABLE] == "C",
+            long_clickable=flags[FLAG_LONG_CLICKABLE] == "L",
+        )
+
+        if stack:
+            stack[-1][1].children.append(node)
+        else:
+            roots.append(node)
+        stack.append((indent, node, (bounds[0], bounds[1])))
+
+    return roots
+
+
+def find_view(roots: List[ViewNode], resource_id: str, visible_only: bool = True) -> Optional[ViewNode]:
+    """Find the first view matching `resource_id`, in short or fully-qualified form.
+
+    Args:
+        roots: Trees from parse_view_tree().
+        resource_id: Either "start_button" or "app:id/start_button".
+        visible_only: Skip views whose visibility is not V (invisible or gone).
+
+    Returns:
+        The matching ViewNode, or None.
+    """
+    for root in roots:
+        for node in root.walk():
+            if visible_only and not node.visible:
+                continue
+            if resource_id in (node.resource_id, node.full_resource_id):
+                return node
+    return None
+
+
+class Capture:
+    """A moment on the device: a screenshot and/or the view tree, captured together.
+
+    Both sources are cheap and neither disturbs the app under test — the screenshot is
+    a `screencap`, the view tree a `dumpsys activity top`. Hold one to compare against
+    later, or several at once.
+    """
+
+    def __init__(self, screenshot: Optional[str] = None, views: Optional[List[ViewNode]] = None):
+        self.screenshot = screenshot
+        self.views = views or []
+
+    def find(self, resource_id: str, visible_only: bool = True) -> Optional[ViewNode]:
+        """Find a view in this capture by resource_id, short or fully-qualified."""
+        return find_view(self.views, resource_id, visible_only=visible_only)
+
+    def release(self):
+        """Delete this capture's screenshot from disk, if it took one."""
+        if self.screenshot and os.path.exists(self.screenshot):
+            os.unlink(self.screenshot)
+        self.screenshot = None
+
+    def __repr__(self):
+        total = sum(1 for r in self.views for _ in r.walk())
+        return f"Capture(screenshot={self.screenshot!r}, views={total})"
 
 
 DEFAULT_ARTIFACT_DIR = "test-failures"

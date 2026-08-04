@@ -255,14 +255,12 @@ class TestElement:
         assert (e.resource_id, e.content_desc, e.text) == ("start_button", "Start", "Start")
 
 
-SAMPLE_HIERARCHY = """<?xml version='1.0' encoding='UTF-8'?>
-<hierarchy rotation="0">
-  <node class="android.widget.FrameLayout" bounds="[0,0][1080,2400]">
-    <node class="android.widget.Button" text="Start" resource-id="com.example:id/start_button"
-          content-desc="Start timer" bounds="[100,200][300,280]" clickable="true" enabled="true"/>
-  </node>
-</hierarchy>
-"""
+SAMPLE_TREE = (
+    "TASK com.example id=1 userId=0\n"
+    "    View Hierarchy:\n"
+    "      com.android.internal.policy.DecorView{db331f6 I.E...... R.....ID 0,0-1080,2400 aid=0}[Main]\n"
+    "        android.widget.Button{aa11bb2 VFE...CL. ......ID 100,200-300,280 #7f0a0999 app:id/start_button}\n"
+)
 
 
 @pytest.fixture
@@ -279,8 +277,12 @@ def tester(monkeypatch, tmp_path):
             f.write(b"\x89PNG\r\n\x1a\n" + b"fake image bytes")
         return output_path
 
+    def fake_shell(command):
+        assert "uiautomator" not in command, "nothing on the happy path may dump the hierarchy"
+        return SAMPLE_TREE if "dumpsys activity top" in command else ""
+
     monkeypatch.setattr(t, "screenshot", fake_screenshot)
-    monkeypatch.setattr(t, "_get_ui_hierarchy", lambda: SAMPLE_HIERARCHY)
+    monkeypatch.setattr(t, "shell", fake_shell)
     return t
 
 
@@ -352,9 +354,11 @@ class TestObserve:
 
         tester.observe("the Start button")
 
-        prompt = tester.client.messages.calls[0]["messages"][0]["content"][0]["text"]
+        content = tester.client.messages.calls[0]["messages"][0]["content"]
+        assert content[0]["type"] == "image"      # observe now sees the screen too
+        prompt = content[1]["text"]
         assert "the Start button" in prompt
-        assert "[100,200][300,280]" in prompt  # the hierarchy bounds made it into the prompt
+        assert '"resource_id": "start_button"' in prompt  # the view tree made it into the prompt
 
 
 class TestExtract:
@@ -385,4 +389,4 @@ class TestExtract:
 
         content = tester.client.messages.calls[0]["messages"][0]["content"]
         assert content[0]["type"] == "image"
-        assert "[100,200][300,280]" in content[1]["text"]
+        assert '"resource_id": "start_button"' in content[1]["text"]

@@ -5,17 +5,20 @@ import pytest
 from android_accessibility_tester import Element
 from test_structured import FakeClient
 
-HIERARCHY = """<?xml version='1.0' encoding='UTF-8'?>
-<hierarchy rotation="0">
-  <node class="android.widget.FrameLayout" bounds="[0,0][1080,2400]">
-    <node class="android.widget.Button" text="Start" resource-id="com.example:id/start_button"
-          content-desc="Start timer" bounds="[100,200][300,280]" clickable="true" enabled="true"/>
-  </node>
-</hierarchy>
-"""
+def dumpsys(button_top=200):
+    """A `dumpsys activity top` window with a Start button at the given y offset."""
+    return (
+        "TASK com.example id=1 userId=0\n"
+        "    View Hierarchy:\n"
+        "      com.android.internal.policy.DecorView{db331f6 I.E...... R.....ID 0,0-1080,2400 aid=0}[Main]\n"
+        f"        android.widget.Button{{aa11bb2 VFE...CL. ......ID "
+        f"100,{button_top}-300,{button_top + 80} #7f0a0999 app:id/start_button}}\n"
+    )
 
+
+TREE = dumpsys()
 # Same screen after a layout shift — same button, different position.
-HIERARCHY_MOVED = HIERARCHY.replace("[100,200][300,280]", "[100,500][300,580]")
+TREE_MOVED = dumpsys(button_top=500)
 
 
 @pytest.fixture
@@ -26,9 +29,20 @@ def tester(monkeypatch):
     monkeypatch.setattr(AndroidAccessibilityTester, "_resolve_default_model", lambda self: "test-model")
     t = AndroidAccessibilityTester(api_key="not-a-real-key")
 
-    t.hierarchy = HIERARCHY
+    t.tree = TREE
     t.taps = []
-    monkeypatch.setattr(t, "_get_ui_hierarchy", lambda: t.hierarchy)
+
+    def fake_shell(command):
+        assert "uiautomator" not in command, "replay must not dump the accessibility hierarchy"
+        return t.tree if "dumpsys activity top" in command else ""
+
+    def fake_screenshot(path):
+        with open(path, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\nfake")
+        return path
+
+    monkeypatch.setattr(t, "shell", fake_shell)
+    monkeypatch.setattr(t, "screenshot", fake_screenshot)
     monkeypatch.setattr(t, "tap", lambda x, y: t.taps.append((x, y)))
     return t
 
@@ -78,20 +92,24 @@ class TestActReplay:
     def test_re_resolves_fresh_bounds_when_the_element_has_moved(self, tester):
         cached = Element(found=True, bounds="[100,200][300,280]", explanation="the Start button",
                          resource_id="start_button")
-        tester.hierarchy = HIERARCHY_MOVED
+        tester.tree = TREE_MOVED
         tester.client = FakeClient()
 
         tester.act(cached)
 
         assert tester.taps == [(200, 540)]  # the new centre, not the cached one
 
-    def test_matches_on_content_desc_when_there_is_no_resource_id(self, tester):
-        cached = Element(found=True, bounds="[0,0][1,1]", explanation="x", content_desc="Start timer")
-        tester.client = FakeClient()
+    def test_an_element_without_a_resource_id_cannot_be_replayed(self, tester):
+        # dumpsys carries no text or content descriptions, so there is nothing to match on.
+        cached = Element(found=True, bounds="[0,0][1,1]", explanation="the Start button",
+                         content_desc="Start timer")
+        tester.client = FakeClient(
+            {"found": True, "bounds": "[100,200][300,280]", "explanation": "the Start button"}
+        )
 
         tester.act(cached)
 
-        assert tester.taps == [(200, 240)]
+        assert len(tester.client.messages.calls) == 1  # fell back to the model
 
     def test_falls_back_to_the_model_when_the_selector_is_gone(self, tester):
         cached = Element(found=True, bounds="[100,200][300,280]", explanation="the Start button",
@@ -113,7 +131,7 @@ class TestResolve:
 
         assert tester.resolve(cached) is None
 
-    def test_returns_none_for_an_element_with_no_selectors_at_all(self, tester):
-        cached = Element(found=True, bounds="[0,0][1,1]", explanation="x")
+    def test_returns_none_for_an_element_with_no_resource_id(self, tester):
+        cached = Element(found=True, bounds="[0,0][1,1]", explanation="x", text="Start")
 
         assert tester.resolve(cached) is None

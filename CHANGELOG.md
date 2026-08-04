@@ -1,3 +1,18 @@
+# version 3.2.0
+
+**Reads structure with `dumpsys activity top` instead of `uiautomator dump`.** `uiautomator dump` runs through `UiAutomation`, which suppresses the accessibility services of the app under test — the opposite of what this framework is for. `dumpsys activity top` goes through ActivityManager and never touches `UiAutomation`. `uiautomator dump` now appears in exactly one place: `save_debug_artifacts`, on the failure path.
+
+* `parse_view_tree(dumpsys_output)` parses the dump into `ViewNode` trees, accumulating each node's parent-relative bounds into absolute screen coordinates. `find_view(roots, resource_id)` matches short or fully-qualified ids and skips invisible views by default.
+* `capture(screenshot=True, views=True)` returns a `Capture` — a free snapshot of the screen with no model call and no disturbance to the app. Both sources by default. Call it purely for a baseline and ignore the result, or hold it and compare later. `.find(resource_id)` reaches into the tree; `.release()` deletes the screenshot.
+* `observe()` and `extract()` now send **both** a screenshot and the view tree: the screenshot shows what each control says, the tree supplies exact bounds and resource ids.
+* `ElementPresent` / `ElementGone` / `resolve()` read the view tree and match on `resource_id` only.
+
+**Breaking:** `dumpsys` carries no text or content descriptions. `ElementPresent(text=...)` and `ElementGone(content_desc=...)` now raise `ValueError` explaining why, rather than silently reaching for a disruptive dump. A cached `Element` without a `resource_id` can no longer be replayed by `resolve()` and falls back to the model. Use `check()` or a pixel condition for anything about what the screen says.
+
+**Removed:** `_get_ui_hierarchy` and `_simplify_node_for_llm`, replaced by `_get_view_tree` and `_view_tree_json`.
+
+Caveat: `dumpsys activity top` output is a debugging dump, not a stable API, and its format can shift between Android versions. `parse_view_tree` concentrates that risk. The parser is built and tested against verbatim output from a real device.
+
 # version 3.1.0
 
 **Automatic failure artifacts.** A pytest hook (`failure_artifact_hook`, wired up in `conftest.py`) saves a screenshot and a UI hierarchy dump when a test fails, to `$ANDROID_TEST_ARTIFACTS` (default `./test-failures`). It locates the tester by type among the test's fixtures, so the fixture can be named anything, and reuses the screenshot from a failed `check()` so the artifact is what the model actually judged. Failures while saving are printed, never raised, so they cannot mask the real failure.

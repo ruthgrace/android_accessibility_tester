@@ -19,13 +19,19 @@ from android_accessibility_tester import (
 FAST = {"timeout": 0.3, "poll_interval": 0.01}
 
 
-def hierarchy_with(*, text="", content_desc="", resource_id=""):
-    return f"""<?xml version='1.0' encoding='UTF-8'?>
-<hierarchy rotation="0">
-  <node class="android.widget.Button" text="{text}" content-desc="{content_desc}"
-        resource-id="{resource_id}" bounds="[0,0][100,100]" clickable="true" enabled="true"/>
-</hierarchy>
-"""
+def dumpsys_with(resource_id=None):
+    """A minimal `dumpsys activity top` window containing at most one identified button."""
+    button = (
+        f"          android.widget.Button{{aa11bb2 VFE...CL. ......ID 0,0-100,100 #7f0a0999 {resource_id}}}"
+        if resource_id else
+        "          android.widget.Button{aa11bb2 VFE...CL. ......ID 0,0-100,100}"
+    )
+    return (
+        "TASK com.example id=1 userId=0\n"
+        "    View Hierarchy:\n"
+        "      com.android.internal.policy.DecorView{db331f6 I.E...... R.....ID 0,0-1080,2400 aid=0}[Main]\n"
+        f"{button}\n"
+    )
 
 
 @pytest.fixture
@@ -38,7 +44,7 @@ def tester(monkeypatch):
     t = AndroidAccessibilityTester(api_key="not-a-real-key")
 
     t.colors = [(255, 0, 0)]      # tests overwrite; last colour repeats forever
-    t.hierarchies = [hierarchy_with()]
+    t.trees = [dumpsys_with()]
     t.shots = 0
     t.dumps = 0
 
@@ -48,13 +54,16 @@ def tester(monkeypatch):
         Image.new("RGB", (10, 10), color).save(output_path)
         return output_path
 
-    def fake_hierarchy():
-        xml = t.hierarchies[min(t.dumps, len(t.hierarchies) - 1)]
+    def fake_shell(command):
+        assert "uiautomator" not in command, "element conditions must not dump the hierarchy"
+        if "dumpsys activity top" not in command:
+            return ""
+        tree = t.trees[min(t.dumps, len(t.trees) - 1)]
         t.dumps += 1
-        return xml
+        return tree
 
     monkeypatch.setattr(t, "screenshot", fake_screenshot)
-    monkeypatch.setattr(t, "_get_ui_hierarchy", fake_hierarchy)
+    monkeypatch.setattr(t, "shell", fake_shell)
     return t
 
 
@@ -119,46 +128,50 @@ class TestWaitForPixelChange:
 
 
 class TestWaitForElement:
-    def test_present_matches_on_content_desc(self, tester):
-        tester.hierarchies = [hierarchy_with(), hierarchy_with(content_desc="Start timer")]
-
-        assert tester.wait_for(ElementPresent(content_desc="Start timer"), **FAST)
-
-    def test_present_matches_on_short_resource_id(self, tester):
-        tester.hierarchies = [hierarchy_with(resource_id="com.example:id/start_button")]
+    def test_present_waits_for_the_id_to_appear(self, tester):
+        tester.trees = [dumpsys_with(), dumpsys_with("app:id/start_button")]
 
         assert tester.wait_for(ElementPresent(resource_id="start_button"), **FAST)
 
-    def test_present_times_out_naming_what_it_looked_for(self, tester):
-        tester.hierarchies = [hierarchy_with()]
+    def test_present_matches_the_fully_qualified_id_too(self, tester):
+        tester.trees = [dumpsys_with("app:id/start_button")]
 
-        result = tester.wait_for(ElementPresent(text="Welcome"), **FAST)
+        assert tester.wait_for(ElementPresent(resource_id="app:id/start_button"), **FAST)
+
+    def test_present_times_out_naming_what_it_looked_for(self, tester):
+        tester.trees = [dumpsys_with()]
+
+        result = tester.wait_for(ElementPresent(resource_id="start_button"), **FAST)
 
         assert not result
-        assert "Welcome" in result.error
+        assert "start_button" in result.error
 
     def test_gone_waits_for_the_element_to_disappear(self, tester):
-        tester.hierarchies = [hierarchy_with(text="Loading..."), hierarchy_with()]
+        tester.trees = [dumpsys_with("app:id/spinner"), dumpsys_with()]
 
-        assert tester.wait_for(ElementGone(text="Loading..."), **FAST)
+        assert tester.wait_for(ElementGone(resource_id="spinner"), **FAST)
 
     def test_gone_times_out_while_the_element_remains(self, tester):
-        tester.hierarchies = [hierarchy_with(text="Loading...")]
+        tester.trees = [dumpsys_with("app:id/spinner")]
 
-        assert not tester.wait_for(ElementGone(text="Loading..."), **FAST)
+        assert not tester.wait_for(ElementGone(resource_id="spinner"), **FAST)
 
-    def test_requires_at_least_one_selector(self):
+    def test_requires_a_resource_id(self):
         with pytest.raises(ValueError):
             ElementPresent()
+
+    def test_rejects_text_selectors_because_they_would_need_uiautomator(self):
+        with pytest.raises(ValueError, match="accessibility services"):
+            ElementPresent(text="Welcome")
 
 
 class TestAnyOf:
     def test_returns_as_soon_as_one_condition_is_satisfied(self, tester):
         tester.colors = [(255, 0, 0), (0, 255, 0)]
-        tester.hierarchies = [hierarchy_with()]
+        tester.trees = [dumpsys_with()]
 
         result = tester.wait_for(
-            AnyOf(ElementPresent(text="never appears"), PixelColor(5, 5, "#00ff00")),
+            AnyOf(ElementPresent(resource_id="never_appears"), PixelColor(5, 5, "#00ff00")),
             **FAST,
         )
 
@@ -168,12 +181,12 @@ class TestAnyOf:
         tester.colors = [(255, 0, 0)]
 
         result = tester.wait_for(
-            AnyOf(ElementPresent(text="Welcome"), PixelColor(5, 5, "#00ff00")),
+            AnyOf(ElementPresent(resource_id="welcome_banner"), PixelColor(5, 5, "#00ff00")),
             **FAST,
         )
 
         assert not result
-        assert "Welcome" in result.error
+        assert "welcome_banner" in result.error
         assert "#00ff00" in result.error
 
     def test_shares_one_screenshot_across_pixel_branches_per_poll(self, tester):
