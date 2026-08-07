@@ -1,3 +1,27 @@
+# version 4.0.0
+
+**Removes the `dumpsys activity top` view tree added in 3.2.0.** Measured on a real device, it failed three independent ways:
+
+* **No text.** `dumpsys` prints class names, ids, bounds and flags, and nothing a control actually says.
+* **Cannot see overlays.** It enumerates Activities; a `SYSTEM_ALERT_WINDOW` added by a Service has no `ActivityRecord`, so an accessibility overlay never appears in it.
+* **Unreliable.** It fans binder calls out to every task on the device. One hung app (Signal, in the measured case) exhausts the 10-second service dump budget, and everything after it is never reached. Five consecutive runs: 10.1s, zero hierarchies.
+
+The third was the dangerous one. A timed-out dump parses as an empty tree, which reads as "nothing is on screen", so `ElementGone` reported success while the element was still present — a silent false pass.
+
+**Removed:** `ElementPresent`, `ElementGone`, `resolve()`, `capture(views=...)`, `ViewNode`, `parse_view_tree`, `find_view`, `_get_view_tree`, `_view_tree_json`.
+
+**Changed:**
+
+* `observe()` and `extract()` read the screenshot alone.
+* `act(element)` on a cached `Element` replays its coordinates directly — no model call, no screenshot, no device round-trip beyond the tap. It no longer re-resolves against a live hierarchy, so a replay does not survive a layout shift.
+* `capture()` returns a screenshot only.
+
+**What remains for deterministic waiting:** `PixelColor`, `PixelChanged`, `Logcat`, and `AnyOf`. For an app you control, `Logcat` is usually the strongest of these — exact, free, and it disturbs nothing.
+
+**Why not go back to `uiautomator`:** it runs through `UiAutomation`, which suppresses the accessibility services of the app under test. The failure is silent — the service stays bound and enabled while its events stop arriving — so a state check cannot detect it. It survives in `save_debug_artifacts` only, on the failure path.
+
+If a real hierarchy is needed, the two viable routes are an instrumentation APK using `setUiAutomationFlags(FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES)`, or a debug-only receiver inside the app under test that walks its own view tree. Both are documented in CLAUDE.md; neither is implemented here.
+
 # version 3.2.0
 
 **Reads structure with `dumpsys activity top` instead of `uiautomator dump`.** `uiautomator dump` runs through `UiAutomation`, which suppresses the accessibility services of the app under test — the opposite of what this framework is for. `dumpsys activity top` goes through ActivityManager and never touches `UiAutomation`. `uiautomator dump` now appears in exactly one place: `save_debug_artifacts`, on the failure path.

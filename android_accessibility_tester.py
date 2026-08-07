@@ -245,7 +245,6 @@ class Tick:
     def __init__(self, tester):
         self.tester = tester
         self._screenshot = None
-        self._views = None
 
     def screenshot(self) -> str:
         """Path to this cycle's screenshot, captured lazily and shared across conditions."""
@@ -260,18 +259,11 @@ class Tick:
         """RGB of a pixel on this cycle's screenshot."""
         return self.tester._get_pixel_color(self.screenshot(), x, y)
 
-    def views(self) -> List["ViewNode"]:
-        """This cycle's view tree, parsed once and shared across conditions."""
-        if self._views is None:
-            self._views = self.tester._get_view_tree()
-        return self._views
-
     def release(self):
         """Delete this cycle's screenshot, if one was taken."""
         if self._screenshot and os.path.exists(self._screenshot):
             os.unlink(self._screenshot)
         self._screenshot = None
-        self._views = None
 
 
 class Condition:
@@ -372,56 +364,6 @@ class PixelChanged(Condition):
 
     def describe(self) -> str:
         return f"pixel at ({self.x}, {self.y}) to change"
-
-
-class _ElementCondition(Condition):
-    """Shared matching for ElementPresent / ElementGone."""
-
-    def __init__(self, resource_id=None, text=None, content_desc=None):
-        if text or content_desc:
-            raise ValueError(
-                "Element conditions match on resource_id only. Matching on text or "
-                "content_desc would require `uiautomator dump`, which suppresses the "
-                "accessibility services of the app under test. Use resource_id, a pixel "
-                "condition, or check() for anything about what the screen says."
-            )
-        if not resource_id:
-            raise ValueError("Provide a resource_id")
-        self.resource_id = resource_id
-
-    def _present(self, tick) -> bool:
-        return find_view(tick.views(), self.resource_id) is not None
-
-    def describe(self) -> str:
-        return f"element resource_id={self.resource_id!r}"
-
-
-class ElementPresent(_ElementCondition):
-    """Wait for an element to appear in the accessibility hierarchy.
-
-    Example:
-        assert tester.wait_for(ElementPresent(resource_id="start_button"), timeout=5)
-    """
-
-    def poll(self, tick):
-        return Result(ok=True) if self._present(tick) else None
-
-    def describe(self) -> str:
-        return f"{super().describe()} to appear"
-
-
-class ElementGone(_ElementCondition):
-    """Wait for an element to disappear from the accessibility hierarchy.
-
-    Example:
-        assert tester.wait_for(ElementGone(resource_id="loading_spinner"), timeout=30)
-    """
-
-    def poll(self, tick):
-        return Result(ok=True) if not self._present(tick) else None
-
-    def describe(self) -> str:
-        return f"{super().describe()} to disappear"
 
 
 class Logcat(Condition):
@@ -632,27 +574,6 @@ class AndroidAccessibilityTester:
             "source": {"type": "base64", "media_type": "image/png", "data": image_data},
         }
 
-    def _view_tree_json(self) -> str:
-        """Serialize the `dumpsys` view tree as JSON for the model.
-
-        Carries ids, absolute bounds and flags but no text — the screenshot supplies
-        anything about what the screen actually says.
-        """
-        def simplify(node):
-            out = {"class": node.cls.split(".")[-1], "bounds": list(node.bounds)}
-            if node.resource_id:
-                out["resource_id"] = node.resource_id
-            if node.clickable:
-                out["clickable"] = True
-            if not node.enabled:
-                out["enabled"] = False
-            kids = [simplify(c) for c in node.children if c.visible]
-            if kids:
-                out["children"] = kids
-            return out
-
-        return json.dumps([simplify(r) for r in self._get_view_tree()], indent=2)
-
     @timing
     def check(self, description: str, screenshot_path: Optional[str] = None,
               model: Optional[str] = None) -> Check:
@@ -744,10 +665,7 @@ class AndroidAccessibilityTester:
                         "type": "text",
                         "text": (
                             "You are reading data off an Android screen. Extract the "
-                            f"following:\n{description}\n\nUse the screenshot above for "
-                            "anything the screen says, and this view tree for structure "
-                            "(it carries ids and bounds but no text):\n"
-                            f"{self._view_tree_json()}"
+                            f"following from the screenshot above:\n{description}"
                         ),
                     },
                 ],
@@ -785,9 +703,8 @@ class AndroidAccessibilityTester:
     def _observe_element(self, description: str, model: Optional[str] = None) -> Element:
         """Locate an element, keeping the model's explanation even when nothing matched.
 
-        Sends a screenshot together with the `dumpsys` view tree: the screenshot shows
-        what each control says, the tree supplies exact bounds and resource ids. Neither
-        source disturbs the accessibility services of the app under test.
+        Reads the screen visually. Nothing here dumps a UI hierarchy, so the
+        accessibility services of the app under test are left alone.
         """
         fd, path = tempfile.mkstemp(suffix=".png")
         os.close(fd)
@@ -799,15 +716,11 @@ class AndroidAccessibilityTester:
                     {
                         "type": "text",
                         "text": (
-                            "Find a specific element on this Android screen.\n\n"
+                            "Find a specific element in this Android screenshot.\n\n"
                             f"Element description: {description}\n\n"
-                            "The screenshot above shows what each control says. This view "
-                            "tree gives exact bounds and resource ids, but carries no text:\n"
-                            f"{self._view_tree_json()}\n\n"
-                            "Identify the element that best matches the description. Prefer "
-                            "bounds and resource_id copied EXACTLY from the view tree; fall "
-                            "back to bounds read off the screenshot if the tree has no "
-                            "matching node."
+                            "Report its bounds as pixel coordinates in the screenshot, in "
+                            "the form [x1,y1][x2,y2]. Be precise: the centre of these "
+                            "bounds is where the tap will land."
                         ),
                     },
                 ],
@@ -933,62 +846,24 @@ class AndroidAccessibilityTester:
             rgb_img = img.convert('RGB')
             return rgb_img.getpixel((x, y))
 
-    def _get_view_tree(self) -> List["ViewNode"]:
-        """Read the view tree via `dumpsys activity top`.
+    def capture(self) -> "Capture":
+        """Capture the current screen, for comparison against a later capture.
 
-        Unlike `uiautomator dump` this goes through ActivityManager, so it does not
-        suppress the accessibility services of the app under test. It carries no text —
-        use a screenshot for anything about what the screen says.
-        """
-        return parse_view_tree(self.shell("dumpsys activity top"))
-
-    def capture(self, screenshot: bool = True, views: bool = True) -> "Capture":
-        """Capture the current screen state, for comparison against a later capture.
-
-        Costs no model calls and does not disturb the app under test. Call it purely to
+        Costs no model call and does not disturb the app under test. Call it purely to
         establish a baseline and ignore the result, or hold it and compare later.
 
-        Args:
-            screenshot: Capture a screenshot. The caller owns the file; call
-                `capture.release()` to delete it.
-            views: Capture the view tree via `dumpsys activity top`.
-
         Returns:
-            Capture, with `.screenshot` (path or None) and `.views` (list of ViewNode).
+            Capture, with `.screenshot` (path). Call `.release()` to delete the file.
 
         Example:
             before = tester.capture()
             tester.act("tap the send button")
             after = tester.capture()
         """
-        path = None
-        if screenshot:
-            fd, path = tempfile.mkstemp(suffix=".png")
-            os.close(fd)
-            self.screenshot(path)
-        return Capture(screenshot=path, views=self._get_view_tree() if views else [])
-
-    def resolve(self, element: Element) -> Optional[Element]:
-        """Re-find a previously observed element in the current hierarchy, without the model.
-
-        Matches on the element's selectors (resource_id, then content_desc, then text) and
-        returns it with fresh bounds, so a cached element still taps the right place after a
-        layout shift. Returns None if no selector matches — the caller can then fall back to
-        observe().
-
-        Args:
-            element: An Element from a previous observe().
-
-        Returns:
-            The same element with current bounds, or None if it is no longer on screen.
-        """
-        if not element.resource_id:
-            return None
-        node = find_view(self._get_view_tree(), element.resource_id)
-        if node is None:
-            return None
-        x1, y1, x2, y2 = node.bounds
-        return element.model_copy(update={"bounds": f"[{x1},{y1}][{x2},{y2}]"})
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        self.screenshot(path)
+        return Capture(screenshot=path)
 
     @timing
     def act(self, target, model: Optional[str] = None) -> ActResult:
@@ -1013,11 +888,13 @@ class AndroidAccessibilityTester:
                 tester.act(start)                              # no model calls
         """
         if isinstance(target, Element):
-            element = self.resolve(target) or self._observe_element(target.explanation, model=model)
-            description = target.explanation
-        else:
-            element = self._observe_element(target, model=model)
-            description = target
+            # A cached element replays its own coordinates: no model call, no screenshot,
+            # and nothing that could disturb the app under test.
+            self.tap(*target.center())
+            return ActResult(ok=True, element=target)
+
+        element = self._observe_element(target, model=model)
+        description = target
 
         if not element.found:
             return ActResult(
@@ -1037,8 +914,8 @@ class AndroidAccessibilityTester:
         conditions look at it.
 
         Args:
-            condition: A Condition — PixelColor, PixelChanged, ElementPresent,
-                ElementGone, Logcat, or AnyOf(...) of those.
+            condition: A Condition — PixelColor, PixelChanged, Logcat, or AnyOf(...)
+                of those.
             timeout: Maximum time to wait, in seconds.
             poll_interval: Time between polls, in seconds.
 
@@ -1048,7 +925,7 @@ class AndroidAccessibilityTester:
             LogcatResult) carrying their diagnostics.
 
         Example:
-            assert tester.wait_for(ElementGone(resource_id="loading_spinner"), timeout=30)
+            assert tester.wait_for(Logcat("MyService", "upload finished"), timeout=30)
 
             result = tester.wait_for(PixelColor(300, 1380, ["#fffad0", "#d2cea4"]))
             assert result, result.error
@@ -1139,165 +1016,15 @@ class AndroidAccessibilityTester:
         if result.returncode != 0:
             raise RuntimeError(f"adb pull {remote_path} failed: {result.stderr.strip()}")
 
-# A line inside a "View Hierarchy:" block, e.g.
-#   android.widget.Button{aa11bb2 VFE...CL. ......ID 100,200-300,280 #7f0a0999 app:id/start_button}
-VIEW_LINE_RE = re.compile(
-    r"^(?P<indent>\s*)(?P<cls>[\w$.]+)\{(?P<hash>[0-9a-f]+)\s+"
-    r"(?P<flags>[\w.]{9})\s+(?P<flags2>[\w.]{8})\s+"
-    r"(?P<left>-?\d+),(?P<top>-?\d+)-(?P<right>-?\d+),(?P<bottom>-?\d+)"
-    r"(?P<rest>[^}]*)\}"
-)
-# The trailing "#7f0a0999 app:id/start_button" — the name is optional.
-VIEW_ID_RE = re.compile(r"#[0-9a-f]+\s+(?P<full>[\w.]+:id/(?P<short>[\w.]+))")
-
-# Positions within the 9-character flag group, e.g. "VFE...CL."
-FLAG_VISIBILITY = 0
-FLAG_ENABLED = 2
-FLAG_CLICKABLE = 6
-FLAG_LONG_CLICKABLE = 7
-
-
-class ViewNode(BaseModel):
-    """A view from `dumpsys activity top`, with bounds resolved to screen coordinates.
-
-    No text: `dumpsys` does not print view content. Use this for structural questions
-    ("is this id present, and where?"); use a screenshot for anything about what the
-    screen says.
-    """
-
-    cls: str
-    resource_id: Optional[str] = None
-    full_resource_id: Optional[str] = None
-    bounds: Tuple[int, int, int, int] = (0, 0, 0, 0)
-    visible: bool = True
-    enabled: bool = True
-    clickable: bool = False
-    long_clickable: bool = False
-    children: List["ViewNode"] = Field(default_factory=list)
-
-    def box(self) -> Tuple[int, int, int, int]:
-        """Return absolute (x1, y1, x2, y2)."""
-        return self.bounds
-
-    def center(self) -> Tuple[int, int]:
-        """Return the center point as (x, y)."""
-        x1, y1, x2, y2 = self.bounds
-        return ((x1 + x2) // 2, (y1 + y2) // 2)
-
-    def walk(self):
-        """Yield this node and every descendant."""
-        yield self
-        for child in self.children:
-            yield from child.walk()
-
-    def __repr__(self):
-        rid = f" #{self.resource_id}" if self.resource_id else ""
-        return f"ViewNode({self.cls.split('.')[-1]}{rid} {self.bounds})"
-
-
-def parse_view_tree(dumpsys_output: str) -> List[ViewNode]:
-    """Parse `adb shell dumpsys activity top` into one ViewNode tree per window.
-
-    `dumpsys` prints each view's bounds relative to its parent; they are accumulated
-    here so every node carries absolute screen coordinates.
-
-    Note this output is a debugging dump, not a stable API — its format can shift
-    between Android versions.
-
-    Args:
-        dumpsys_output: Raw stdout of `dumpsys activity top`.
-
-    Returns:
-        One root ViewNode per "View Hierarchy:" section, in the order printed.
-    """
-    roots: List[ViewNode] = []
-    # Stack of (indent, node, absolute_origin) for the branch currently being built.
-    stack: List[Tuple[int, ViewNode, Tuple[int, int]]] = []
-    in_hierarchy = False
-
-    for line in dumpsys_output.splitlines():
-        if not line.strip():
-            continue
-        if line.strip() == "View Hierarchy:":
-            in_hierarchy = True
-            stack = []
-            continue
-        if not in_hierarchy:
-            continue
-
-        match = VIEW_LINE_RE.match(line)
-        if not match:
-            # A non-view line at this point means the hierarchy section has ended.
-            in_hierarchy = False
-            stack = []
-            continue
-
-        indent = len(match.group("indent"))
-        while stack and stack[-1][0] >= indent:
-            stack.pop()
-
-        left, top = int(match.group("left")), int(match.group("top"))
-        right, bottom = int(match.group("right")), int(match.group("bottom"))
-        origin_x, origin_y = stack[-1][2] if stack else (0, 0)
-        bounds = (origin_x + left, origin_y + top, origin_x + right, origin_y + bottom)
-
-        flags = match.group("flags")
-        id_match = VIEW_ID_RE.search(match.group("rest"))
-        node = ViewNode(
-            cls=match.group("cls"),
-            resource_id=id_match.group("short") if id_match else None,
-            full_resource_id=id_match.group("full") if id_match else None,
-            bounds=bounds,
-            visible=flags[FLAG_VISIBILITY] == "V",
-            enabled=flags[FLAG_ENABLED] == "E",
-            clickable=flags[FLAG_CLICKABLE] == "C",
-            long_clickable=flags[FLAG_LONG_CLICKABLE] == "L",
-        )
-
-        if stack:
-            stack[-1][1].children.append(node)
-        else:
-            roots.append(node)
-        stack.append((indent, node, (bounds[0], bounds[1])))
-
-    return roots
-
-
-def find_view(roots: List[ViewNode], resource_id: str, visible_only: bool = True) -> Optional[ViewNode]:
-    """Find the first view matching `resource_id`, in short or fully-qualified form.
-
-    Args:
-        roots: Trees from parse_view_tree().
-        resource_id: Either "start_button" or "app:id/start_button".
-        visible_only: Skip views whose visibility is not V (invisible or gone).
-
-    Returns:
-        The matching ViewNode, or None.
-    """
-    for root in roots:
-        for node in root.walk():
-            if visible_only and not node.visible:
-                continue
-            if resource_id in (node.resource_id, node.full_resource_id):
-                return node
-    return None
-
-
 class Capture:
-    """A moment on the device: a screenshot and/or the view tree, captured together.
+    """A screenshot of the device at one moment, held for later comparison.
 
-    Both sources are cheap and neither disturbs the app under test — the screenshot is
-    a `screencap`, the view tree a `dumpsys activity top`. Hold one to compare against
-    later, or several at once.
+    Costs no model call and does not disturb the app under test. Hold one to compare
+    against later, or several at once.
     """
 
-    def __init__(self, screenshot: Optional[str] = None, views: Optional[List[ViewNode]] = None):
+    def __init__(self, screenshot: Optional[str] = None):
         self.screenshot = screenshot
-        self.views = views or []
-
-    def find(self, resource_id: str, visible_only: bool = True) -> Optional[ViewNode]:
-        """Find a view in this capture by resource_id, short or fully-qualified."""
-        return find_view(self.views, resource_id, visible_only=visible_only)
 
     def release(self):
         """Delete this capture's screenshot from disk, if it took one."""
@@ -1306,8 +1033,7 @@ class Capture:
         self.screenshot = None
 
     def __repr__(self):
-        total = sum(1 for r in self.views for _ in r.walk())
-        return f"Capture(screenshot={self.screenshot!r}, views={total})"
+        return f"Capture(screenshot={self.screenshot!r})"
 
 
 DEFAULT_ARTIFACT_DIR = "test-failures"

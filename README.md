@@ -24,19 +24,19 @@ export ANTHROPIC_API_KEY=your_api_key_here
 The API is organized by what you want, not by which mechanism supplies it:
 
 ```python
-from android_accessibility_tester import AndroidAccessibilityTester, ElementGone
+from android_accessibility_tester import AndroidAccessibilityTester, Logcat
 
 tester = AndroidAccessibilityTester()
 tester.open_app("com.example.myapp")
 
 assert tester.act("tap the Start button")                          # find and tap
-assert tester.wait_for(ElementGone(resource_id="spinner"), timeout=30)
+assert tester.wait_for(Logcat("MyService", "load complete"), timeout=30)
 assert tester.check("the results list is showing with at least one row")
 ```
 
-`observe()` locates an element and returns it *without* acting, carrying its selectors as well
-as its bounds. Cache that result and `act()` on it to replay the tap with no further model
-calls — it re-resolves against the live hierarchy, so it survives layout shifts:
+`observe()` locates an element and returns it *without* acting. Cache that result and `act()`
+on it to replay the tap with no further model calls — this is the droidrun-and-hardcode
+workflow with the manual step removed. Re-observe when the layout changes:
 
 ```python
 start = tester.observe("the Start Timer button")   # one model call

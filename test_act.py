@@ -5,22 +5,6 @@ import pytest
 from android_accessibility_tester import Element
 from test_structured import FakeClient
 
-def dumpsys(button_top=200):
-    """A `dumpsys activity top` window with a Start button at the given y offset."""
-    return (
-        "TASK com.example id=1 userId=0\n"
-        "    View Hierarchy:\n"
-        "      com.android.internal.policy.DecorView{db331f6 I.E...... R.....ID 0,0-1080,2400 aid=0}[Main]\n"
-        f"        android.widget.Button{{aa11bb2 VFE...CL. ......ID "
-        f"100,{button_top}-300,{button_top + 80} #7f0a0999 app:id/start_button}}\n"
-    )
-
-
-TREE = dumpsys()
-# Same screen after a layout shift — same button, different position.
-TREE_MOVED = dumpsys(button_top=500)
-
-
 @pytest.fixture
 def tester(monkeypatch):
     from android_accessibility_tester import AndroidAccessibilityTester
@@ -29,12 +13,10 @@ def tester(monkeypatch):
     monkeypatch.setattr(AndroidAccessibilityTester, "_resolve_default_model", lambda self: "test-model")
     t = AndroidAccessibilityTester(api_key="not-a-real-key")
 
-    t.tree = TREE
     t.taps = []
 
     def fake_shell(command):
-        assert "uiautomator" not in command, "replay must not dump the accessibility hierarchy"
-        return t.tree if "dumpsys activity top" in command else ""
+        raise AssertionError(f"nothing on the happy path may shell out: {command!r}")
 
     def fake_screenshot(path):
         with open(path, "wb") as f:
@@ -69,19 +51,21 @@ class TestActFromDescription:
 
     def test_exposes_the_element_it_acted_on(self, tester):
         tester.client = FakeClient(
-            {"found": True, "bounds": "[100,200][300,280]", "explanation": "x",
-             "resource_id": "start_button"}
+            {"found": True, "bounds": "[100,200][300,280]", "explanation": "x"}
         )
 
         result = tester.act("tap the Start button")
 
-        assert result.element.resource_id == "start_button"
+        assert result.element.center() == (200, 240)
 
 
 class TestActReplay:
+    """A cached Element replays its own bounds. There is no hierarchy to re-resolve
+    against without disturbing the app, so a replay is a plain tap at the coordinates
+    observed earlier — the droidrun-and-hardcode workflow, minus the manual step."""
+
     def test_replays_a_cached_element_without_calling_the_model(self, tester):
-        cached = Element(found=True, bounds="[100,200][300,280]", explanation="the Start button",
-                         resource_id="start_button")
+        cached = Element(found=True, bounds="[100,200][300,280]", explanation="the Start button")
         tester.client = FakeClient()  # any API call would IndexError
 
         result = tester.act(cached)
@@ -89,49 +73,21 @@ class TestActReplay:
         assert result
         assert tester.taps == [(200, 240)]
 
-    def test_re_resolves_fresh_bounds_when_the_element_has_moved(self, tester):
-        cached = Element(found=True, bounds="[100,200][300,280]", explanation="the Start button",
-                         resource_id="start_button")
-        tester.tree = TREE_MOVED
+    def test_replays_the_same_coordinates_every_time(self, tester):
+        cached = Element(found=True, bounds="[100,200][300,280]", explanation="the Start button")
         tester.client = FakeClient()
 
+        for _ in range(3):
+            tester.act(cached)
+
+        assert tester.taps == [(200, 240)] * 3
+
+    def test_a_replay_takes_no_screenshot_either(self, tester):
+        cached = Element(found=True, bounds="[100,200][300,280]", explanation="x")
+        tester.client = FakeClient()
+        shots = []
+        tester.screenshot = lambda p: shots.append(p)
+
         tester.act(cached)
 
-        assert tester.taps == [(200, 540)]  # the new centre, not the cached one
-
-    def test_an_element_without_a_resource_id_cannot_be_replayed(self, tester):
-        # dumpsys carries no text or content descriptions, so there is nothing to match on.
-        cached = Element(found=True, bounds="[0,0][1,1]", explanation="the Start button",
-                         content_desc="Start timer")
-        tester.client = FakeClient(
-            {"found": True, "bounds": "[100,200][300,280]", "explanation": "the Start button"}
-        )
-
-        tester.act(cached)
-
-        assert len(tester.client.messages.calls) == 1  # fell back to the model
-
-    def test_falls_back_to_the_model_when_the_selector_is_gone(self, tester):
-        cached = Element(found=True, bounds="[100,200][300,280]", explanation="the Start button",
-                         resource_id="a_button_that_no_longer_exists")
-        tester.client = FakeClient(
-            {"found": True, "bounds": "[100,500][300,580]", "explanation": "relocated Start button"}
-        )
-
-        result = tester.act(cached)
-
-        assert result
-        assert tester.taps == [(200, 540)]
-        assert len(tester.client.messages.calls) == 1
-
-
-class TestResolve:
-    def test_returns_none_when_no_selector_matches(self, tester):
-        cached = Element(found=True, bounds="[0,0][1,1]", explanation="x", resource_id="nope")
-
-        assert tester.resolve(cached) is None
-
-    def test_returns_none_for_an_element_with_no_resource_id(self, tester):
-        cached = Element(found=True, bounds="[0,0][1,1]", explanation="x", text="Start")
-
-        assert tester.resolve(cached) is None
+        assert shots == []

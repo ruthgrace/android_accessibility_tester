@@ -9,29 +9,13 @@ from PIL import Image
 
 from android_accessibility_tester import (
     AnyOf,
-    ElementGone,
-    ElementPresent,
+    Logcat,
     PixelChanged,
     PixelColor,
     Result,
 )
 
 FAST = {"timeout": 0.3, "poll_interval": 0.01}
-
-
-def dumpsys_with(resource_id=None):
-    """A minimal `dumpsys activity top` window containing at most one identified button."""
-    button = (
-        f"          android.widget.Button{{aa11bb2 VFE...CL. ......ID 0,0-100,100 #7f0a0999 {resource_id}}}"
-        if resource_id else
-        "          android.widget.Button{aa11bb2 VFE...CL. ......ID 0,0-100,100}"
-    )
-    return (
-        "TASK com.example id=1 userId=0\n"
-        "    View Hierarchy:\n"
-        "      com.android.internal.policy.DecorView{db331f6 I.E...... R.....ID 0,0-1080,2400 aid=0}[Main]\n"
-        f"{button}\n"
-    )
 
 
 @pytest.fixture
@@ -44,9 +28,7 @@ def tester(monkeypatch):
     t = AndroidAccessibilityTester(api_key="not-a-real-key")
 
     t.colors = [(255, 0, 0)]      # tests overwrite; last colour repeats forever
-    t.trees = [dumpsys_with()]
     t.shots = 0
-    t.dumps = 0
 
     def fake_screenshot(output_path):
         color = t.colors[min(t.shots, len(t.colors) - 1)]
@@ -55,12 +37,7 @@ def tester(monkeypatch):
         return output_path
 
     def fake_shell(command):
-        assert "uiautomator" not in command, "element conditions must not dump the hierarchy"
-        if "dumpsys activity top" not in command:
-            return ""
-        tree = t.trees[min(t.dumps, len(t.trees) - 1)]
-        t.dumps += 1
-        return tree
+        raise AssertionError(f"waiting must not shell out: {command!r}")
 
     monkeypatch.setattr(t, "screenshot", fake_screenshot)
     monkeypatch.setattr(t, "shell", fake_shell)
@@ -127,66 +104,27 @@ class TestWaitForPixelChange:
         assert "#ff0000" in result.error
 
 
-class TestWaitForElement:
-    def test_present_waits_for_the_id_to_appear(self, tester):
-        tester.trees = [dumpsys_with(), dumpsys_with("app:id/start_button")]
-
-        assert tester.wait_for(ElementPresent(resource_id="start_button"), **FAST)
-
-    def test_present_matches_the_fully_qualified_id_too(self, tester):
-        tester.trees = [dumpsys_with("app:id/start_button")]
-
-        assert tester.wait_for(ElementPresent(resource_id="app:id/start_button"), **FAST)
-
-    def test_present_times_out_naming_what_it_looked_for(self, tester):
-        tester.trees = [dumpsys_with()]
-
-        result = tester.wait_for(ElementPresent(resource_id="start_button"), **FAST)
-
-        assert not result
-        assert "start_button" in result.error
-
-    def test_gone_waits_for_the_element_to_disappear(self, tester):
-        tester.trees = [dumpsys_with("app:id/spinner"), dumpsys_with()]
-
-        assert tester.wait_for(ElementGone(resource_id="spinner"), **FAST)
-
-    def test_gone_times_out_while_the_element_remains(self, tester):
-        tester.trees = [dumpsys_with("app:id/spinner")]
-
-        assert not tester.wait_for(ElementGone(resource_id="spinner"), **FAST)
-
-    def test_requires_a_resource_id(self):
-        with pytest.raises(ValueError):
-            ElementPresent()
-
-    def test_rejects_text_selectors_because_they_would_need_uiautomator(self):
-        with pytest.raises(ValueError, match="accessibility services"):
-            ElementPresent(text="Welcome")
-
-
 class TestAnyOf:
     def test_returns_as_soon_as_one_condition_is_satisfied(self, tester):
         tester.colors = [(255, 0, 0), (0, 255, 0)]
-        tester.trees = [dumpsys_with()]
+        never = Logcat("NoSuchTag", "never logged", clear_first=False)
+        never.start = lambda tester: None          # no logcat subprocess in unit tests
+        never.stop = lambda tester: None
 
-        result = tester.wait_for(
-            AnyOf(ElementPresent(resource_id="never_appears"), PixelColor(5, 5, "#00ff00")),
-            **FAST,
-        )
+        result = tester.wait_for(AnyOf(never, PixelColor(5, 5, "#00ff00")), **FAST)
 
         assert result
 
     def test_times_out_reporting_every_branch(self, tester):
         tester.colors = [(255, 0, 0)]
+        never = Logcat("NoSuchTag", "never logged", clear_first=False)
+        never.start = lambda tester: None
+        never.stop = lambda tester: None
 
-        result = tester.wait_for(
-            AnyOf(ElementPresent(resource_id="welcome_banner"), PixelColor(5, 5, "#00ff00")),
-            **FAST,
-        )
+        result = tester.wait_for(AnyOf(never, PixelColor(5, 5, "#00ff00")), **FAST)
 
         assert not result
-        assert "welcome_banner" in result.error
+        assert "never logged" in result.error
         assert "#00ff00" in result.error
 
     def test_shares_one_screenshot_across_pixel_branches_per_poll(self, tester):

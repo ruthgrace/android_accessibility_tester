@@ -12,7 +12,7 @@ The API is organized around **what you want**, not which mechanism supplies it, 
 
 1. **Deterministic, free** — `tap`, `swipe`, `input_text`, `press_key`, `shell`, `screenshot`
 2. **Deterministic, polled** — `wait_for(condition)`
-3. **Cached** — `observe()` once, then `act(element)` / `resolve(element)` with no model calls
+3. **Cached** — `observe()` once, then `act(element)` with no model calls
 4. **Model-backed** — `check()`, `extract()`, `act("natural language")`
 
 Every model call uses forced tool use with a pydantic schema, so responses are validated JSON rather than prose that has to be parsed.
@@ -107,11 +107,9 @@ for _ in range(10):
     tester.act(start)
 ```
 
-**resolve(element) → Element | None**
-
-Re-finds a cached element in the current view tree without the model, returning it with fresh
-bounds. Matches on `resource_id` only — an element observed without one cannot be replayed and
-falls back to the model.
+A cached `Element` replays its own coordinates — no model call, no screenshot, nothing that
+touches the device beyond the tap itself. There is no re-resolution against a live hierarchy,
+so a replay does not survive a layout shift; re-`observe()` when the layout changes.
 
 ## Waiting
 
@@ -125,82 +123,76 @@ Conditions:
 |---|---|
 | `PixelColor(x, y, colors, exclude=False)` | Pixel to become one of `colors` (a hex string, RGB tuple, or list). With `exclude=True`, any color *other* than those. |
 | `PixelChanged(x, y)` | Pixel to become any color other than its starting one |
-| `ElementPresent(resource_id=)` | Element to appear. Matches short or fully-qualified id. |
-| `ElementGone(resource_id=)` | Element to disappear |
 | `Logcat(tag, message, clear_first=True)` | A logcat line under `tag` containing `message` |
 | `AnyOf(*conditions)` | Whichever fires first |
 
 ```python
 tester.wait_for(PixelColor(300, 1380, ["#fffad0", "#d2cea4"]), timeout=30)
 tester.wait_for(PixelColor(300, 1380, ["#ffffff", "#1b1b1b"], exclude=True))
-assert tester.wait_for(ElementGone(resource_id="loading_spinner"), timeout=30)
+assert tester.wait_for(Logcat("MyService", "upload finished"), timeout=30)
 assert tester.wait_for(AnyOf(Logcat("Overlay", "created"), PixelChanged(300, 1380)))
 ```
 
-`ElementPresent` / `ElementGone` require a `resource_id`. Passing `text` or `content_desc`
-raises `ValueError`: matching on those would need `uiautomator dump`. They read the view tree
-via `dumpsys activity top`, so they cost no model calls and do not disturb the app.
+There are no element-based conditions: every way of reading the hierarchy either disturbs the
+app under test or is unreliable. See the constraint section below.
 
 ## The Accessibility Service Constraint
 
-This framework exists to test apps that hold accessibility permissions, so nothing on the
-happy path may disturb them.
+This framework tests apps that hold accessibility permissions, so nothing on the happy path
+may disturb them. In practice that rules out reading the UI hierarchy at all.
 
-`uiautomator dump` does exactly that. It runs through `UiAutomation`, which **suppresses the
-accessibility services of the app under test**. `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES`
-exists but is only settable from instrumentation code — `adb shell uiautomator dump` cannot
-pass it. Reports indicate the services are destroyed rather than paused: still enabled in
-Settings, but needing a disable/re-enable cycle to return.
+**`uiautomator dump`** runs through `UiAutomation`, which suppresses the accessibility
+services of the app under test. `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES` exists but is only
+settable from instrumentation code, so `adb shell` cannot pass it. The failure is quiet: the
+service stays bound and enabled while its events stop arriving, so a state check will not
+catch it.
 
-**So the framework reads structure with `dumpsys activity top` instead.** That goes through
-ActivityManager and never touches `UiAutomation`, so it leaves the app's services alone.
+**`dumpsys activity top`** was tried as a replacement in 3.2.0 and removed in 4.0.0. It never
+touches `UiAutomation`, but measured on a real device it fails three ways: it carries **no
+text**; it cannot see `SYSTEM_ALERT_WINDOW` overlays, because it enumerates Activities and an
+overlay added by a Service has no `ActivityRecord`; and it fans binder calls out to every task
+on the device, so one hung app takes the whole dump down with a 10-second timeout. Worse, a
+timed-out dump parses as an empty tree, which silently reads as "nothing is on screen" — an
+`ElementGone` check would pass while the element was still there.
 
-`uiautomator dump` now appears in exactly one place: `save_debug_artifacts`, on the failure
-path, where the test is already over and there is nothing left to disturb.
+**So the framework reads the screen visually.** `uiautomator dump` survives in exactly one
+place: `save_debug_artifacts`, on the failure path, where the test is already over.
 
-### What each source gives you
+### What that costs
 
-| | `dumpsys activity top` | screenshot | `uiautomator dump` |
-|---|---|---|---|
-| Disturbs the app | no | no | **yes** |
-| resource ids | yes | no | yes |
-| bounds | yes (parent-relative, resolved to absolute here) | no | yes (absolute) |
-| clickable / enabled / visible | yes | no | yes |
-| **text and content descriptions** | **no** | yes (visually) | yes |
-| Used on the happy path | yes | yes | never |
+There is no element location by resource id, and no waiting on an element by id or text. What
+remains for deterministic waiting is `PixelColor`, `PixelChanged` and `Logcat`.
 
-The missing text is why `observe()` and `extract()` send **both** a screenshot and the view
-tree: the screenshot shows what each control says, the tree supplies exact bounds and ids.
+For an app you control, `Logcat` is usually the strongest option — it is exact, free, needs no
+model call, and disturbs nothing:
 
-Because there is no text, element conditions and `resolve()` match on `resource_id` only.
-`ElementPresent(text=...)` raises `ValueError` explaining why rather than silently reaching
-for a disruptive dump.
+```python
+assert tester.wait_for(Logcat("MyAccessibilityService", "overlay created"), timeout=30)
+```
 
-`dumpsys activity top` output is a debugging dump, not a stable API — its format can shift
-between Android versions. `parse_view_tree` is where that risk is concentrated.
+### Options if you need a real hierarchy
+
+- **An instrumentation APK** using `setUiAutomationFlags(FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES)`.
+  Full fidelity including text and overlay windows, at the cost of a test APK driven by
+  `am instrument`. Verify it functionally before trusting it — the silent failure above means a
+  state check proves nothing.
+- **A debug-only receiver inside the app under test** that walks its own view tree and returns
+  JSON. Full text, sees its own overlays, immune to other apps, no accessibility interaction.
+  Only covers your own app.
 
 ## Capturing State
 
-**capture(screenshot=True, views=True) → Capture**
+**capture() → Capture**
 
-A free snapshot of the current screen — no model call, and nothing that disturbs the app.
-Both sources are captured by default. Call it purely to establish a baseline and ignore the
-result, or hold it and compare later.
+A screenshot of the current moment, held for later comparison. No model call, nothing that
+disturbs the app.
 
 ```python
 before = tester.capture()
 tester.act("tap the send button")
 after = tester.capture()
-
-assert after.find("message_row") is not None
-before.release()   # deletes the screenshot file
+before.release()   # deletes the file
 ```
-
-`Capture` has `.screenshot` (path or None), `.views` (list of `ViewNode`), `.find(resource_id)`
-and `.release()`.
-
-`ViewNode` carries `.cls`, `.resource_id`, `.full_resource_id`, `.bounds` (absolute),
-`.visible`, `.enabled`, `.clickable`, `.children`, plus `.box()`, `.center()` and `.walk()`.
 
 ### Failure Artifacts
 
@@ -215,11 +207,10 @@ def pytest_runtest_makereport(item, call):
 ```
 
 On failure this saves a screenshot and a full hierarchy dump to `$ANDROID_TEST_ARTIFACTS`
-(default `./test-failures`), named after the test. It finds the tester by type among the
-test's fixtures, so the fixture can be called anything. If the last `check()` failed, its
-screenshot is reused, so the artifact is what the model actually judged rather than a fresh
-capture of a screen that has since moved on. Errors while saving are printed and swallowed,
-so artifact capture can never mask the real failure.
+(default `./test-failures`), named after the test. It finds the tester by type among the test's
+fixtures, so the fixture can be called anything. If the last `check()` failed, its screenshot
+is reused, so the artifact is what the model actually judged. Errors while saving are printed
+and swallowed, so artifact capture can never mask the real failure.
 
 Copy `conftest.py` into your own suite to get the same behaviour.
 
@@ -251,14 +242,14 @@ export ANTHROPIC_API_KEY=your_api_key_here
 Unit tests for the framework itself need no device or API key:
 
 ```bash
-./venv/bin/pytest test_structured.py test_wait.py test_act.py test_viewtree.py test_failure_artifacts.py
+./venv/bin/pytest test_structured.py test_wait.py test_act.py test_failure_artifacts.py
 ```
 
 ## Example Test Structure
 
 ```python
 import android_accessibility_tester
-from android_accessibility_tester import ElementGone, PixelColor
+from android_accessibility_tester import Logcat, PixelColor
 import pytest
 
 @pytest.fixture(scope="function")
@@ -269,7 +260,7 @@ def tester():
 
 def test_my_feature(tester):
     assert tester.act("tap the Start button")
-    assert tester.wait_for(ElementGone(resource_id="spinner"), timeout=30)
+    assert tester.wait_for(Logcat("MyService", "load complete"), timeout=30)
     assert tester.check("the results list is showing with at least one row")
 ```
 
@@ -291,20 +282,14 @@ Note that pydantic's default lax mode coerces some values — `"yes"`, `"on"` an
 
 `input_text()` handles ADB requirements: spaces become `%s`, and `()` are escaped.
 
-### View Tree Simplification
-
-`dumpsys` output is parsed by `parse_view_tree` into `ViewNode` trees, accumulating each
-node's parent-relative bounds into absolute screen coordinates. Before being sent to Claude
-it is reduced to class name, resource id, bounds and the clickable/enabled flags, with
-invisible subtrees dropped.
-
 ### Screenshot Workflow
 
 Device captures to `/sdcard/screenshot.png`, ADB pulls to the local path, the device file is removed (failure ignored — scoped storage may block `rm`).
 
 ## Tips & Best Practices
 
-1. **Observe once, replay after** — `observe()` costs a model call; `act(element)` and `resolve(element)` cost none. For repeated interactions, cache the `Element`.
+1. **Observe once, replay after** — `observe()` costs a model call; `act(element)` on a cached
+   Element costs none. Re-observe when the layout changes.
 2. **Precise descriptions** — `check()` only passes if all described elements match.
 3. **Prefer `extract` over prose checks** when asserting on a value: `assert state.remaining_seconds > 0` beats describing the whole screen.
 4. **Per-test cleanup** — use function-scoped fixtures for clean state between tests.

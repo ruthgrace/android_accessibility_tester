@@ -255,14 +255,6 @@ class TestElement:
         assert (e.resource_id, e.content_desc, e.text) == ("start_button", "Start", "Start")
 
 
-SAMPLE_TREE = (
-    "TASK com.example id=1 userId=0\n"
-    "    View Hierarchy:\n"
-    "      com.android.internal.policy.DecorView{db331f6 I.E...... R.....ID 0,0-1080,2400 aid=0}[Main]\n"
-    "        android.widget.Button{aa11bb2 VFE...CL. ......ID 100,200-300,280 #7f0a0999 app:id/start_button}\n"
-)
-
-
 @pytest.fixture
 def tester(monkeypatch, tmp_path):
     """A tester with no device and no network: adb, screenshots and the API are all stubbed."""
@@ -278,8 +270,7 @@ def tester(monkeypatch, tmp_path):
         return output_path
 
     def fake_shell(command):
-        assert "uiautomator" not in command, "nothing on the happy path may dump the hierarchy"
-        return SAMPLE_TREE if "dumpsys activity top" in command else ""
+        raise AssertionError(f"nothing on the happy path may shell out: {command!r}")
 
     monkeypatch.setattr(t, "screenshot", fake_screenshot)
     monkeypatch.setattr(t, "shell", fake_shell)
@@ -349,16 +340,14 @@ class TestObserve:
 
         assert tester.observe("a nonexistent widget") is None
 
-    def test_sends_the_simplified_hierarchy_and_the_description(self, tester):
+    def test_sends_a_screenshot_and_the_description(self, tester):
         tester.client = FakeClient({"found": False, "explanation": "no"})
 
         tester.observe("the Start button")
 
         content = tester.client.messages.calls[0]["messages"][0]["content"]
-        assert content[0]["type"] == "image"      # observe now sees the screen too
-        prompt = content[1]["text"]
-        assert "the Start button" in prompt
-        assert '"resource_id": "start_button"' in prompt  # the view tree made it into the prompt
+        assert content[0]["type"] == "image"
+        assert "the Start button" in content[1]["text"]
 
 
 class TestExtract:
@@ -377,7 +366,7 @@ class TestExtract:
         assert state.remaining_seconds == 42
         assert state.is_running is True
 
-    def test_sends_both_the_screenshot_and_the_hierarchy(self, tester):
+    def test_sends_the_screenshot(self, tester):
         class Anything(BaseModel):
             """Anything at all."""
 
@@ -389,4 +378,34 @@ class TestExtract:
 
         content = tester.client.messages.calls[0]["messages"][0]["content"]
         assert content[0]["type"] == "image"
-        assert '"resource_id": "start_button"' in content[1]["text"]
+        assert "something" in content[1]["text"]
+
+
+class TestCapture:
+    def test_captures_a_screenshot(self, tester):
+        capture = tester.capture()
+
+        assert capture.screenshot is not None
+        assert os.path.exists(capture.screenshot)
+        capture.release()
+
+    def test_does_not_shell_out(self, tester):
+        # The fixture's fake_shell raises: capturing must never dump a hierarchy.
+        tester.capture().release()
+
+    def test_release_removes_the_file(self, tester):
+        capture = tester.capture()
+        path = capture.screenshot
+
+        capture.release()
+
+        assert not os.path.exists(path)
+        assert capture.screenshot is None
+
+    def test_captures_are_independent(self, tester):
+        first = tester.capture()
+        second = tester.capture()
+
+        assert first.screenshot != second.screenshot
+        first.release()
+        second.release()
