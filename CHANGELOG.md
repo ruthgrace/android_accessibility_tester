@@ -1,3 +1,25 @@
+# version 4.1.0
+
+**Structured outputs replace forced tool use.** `structured_call` now asks for JSON via
+`output_config.format` (`json_schema`) instead of `tool_choice: {type: "tool"}`. The newest
+models (Sonnet 5.5, Fable 5.1) reject forced tool choice with
+`tool_choice: type "tool" and "any" are not supported for this model.`, and because the default
+model resolves to the newest Sonnet, every `check()`/`observe()`/`extract()` started failing the
+day that model shipped.
+
+**Changed:**
+
+* Schemas are sent with `additionalProperties: false` on every object (`_strict_schema`), which
+  the structured-outputs endpoint requires. Pydantic models need no change.
+* The output model's docstring, formerly the tool description, is appended to the prompt as
+  `Respond with: <docstring>`.
+* Schema-violation retries send the pydantic errors as a follow-up user text message rather than
+  a `tool_result`. Non-JSON text is treated as a schema violation and retried the same way.
+* `output_config` is passed through `extra_body`, so the existing `anthropic>=0.39` pin still
+  holds for callers on older SDKs.
+
+**Removed:** `TOOL_NAME`.
+
 # version 4.0.0
 
 **Removes the `dumpsys activity top` view tree added in 3.2.0.** Measured on a real device, it failed three independent ways:

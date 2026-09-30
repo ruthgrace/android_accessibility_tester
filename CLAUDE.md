@@ -15,7 +15,7 @@ The API is organized around **what you want**, not which mechanism supplies it, 
 3. **Cached** — `observe()` once, then `act(element)` with no model calls
 4. **Model-backed** — `check()`, `extract()`, `act("natural language")`
 
-Every model call uses forced tool use with a pydantic schema, so responses are validated JSON rather than prose that has to be parsed.
+Every model call uses structured outputs (`output_config.format`) with a pydantic schema, so responses are validated JSON rather than prose that has to be parsed. Forced tool use is not used: the newest models reject `tool_choice: tool`/`any` with a 400.
 
 ## Core Components
 
@@ -272,7 +272,7 @@ Claude API calls retry with exponential backoff (1s, 2s, 4s, 8s, then one final 
 
 ### Schema Violations
 
-If a response doesn't validate against the requested schema, the pydantic errors are returned to the model as a `tool_result` and it retries once. If it still fails, `StructuredCallError` is raised.
+If a response doesn't validate against the requested schema (or is not JSON), the pydantic errors are sent back to the model as a follow-up user message and it retries once. If it still fails, `StructuredCallError` is raised.
 
 Note that pydantic's default lax mode coerces some values — `"yes"`, `"on"` and `"1"` all validate as `True` for a `bool` field. Use strict types if you need that rejected.
 

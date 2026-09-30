@@ -43,7 +43,20 @@ TRANSIENT_API_ERRORS = (RateLimitError, InternalServerError, APITimeoutError, AP
 RETRY_DELAYS = [1, 2, 4, 8]  # exponential backoff, plus one final attempt
 MAX_SCHEMA_ATTEMPTS = 2
 
-TOOL_NAME = "record_result"
+def _strict_schema(schema):
+    """Return a copy of a JSON schema with `additionalProperties: false` on every object.
+
+    The structured-outputs endpoint requires it on all objects; pydantic's
+    `model_json_schema()` omits it. Applies to nested objects and `$defs` too.
+    """
+    if isinstance(schema, dict):
+        out = {k: _strict_schema(v) for k, v in schema.items()}
+        if out.get("type") == "object" and "additionalProperties" not in out:
+            out["additionalProperties"] = False
+        return out
+    if isinstance(schema, list):
+        return [_strict_schema(v) for v in schema]
+    return schema
 
 
 class StructuredCallError(RuntimeError):
@@ -53,10 +66,11 @@ class StructuredCallError(RuntimeError):
 def structured_call(client, model: str, content, output_model, max_tokens: int = 1024):
     """Call Claude and return a validated instance of `output_model`.
 
-    Uses forced tool use so the response is JSON conforming to the model's schema —
-    no prose parsing. Transient API errors are retried with exponential backoff;
-    responses that violate the schema are retried by showing the model its own
-    validation errors.
+    Uses structured outputs (`output_config.format`) so the response is JSON
+    conforming to the model's schema — no prose parsing, and no forced tool use,
+    which newer models reject. Transient API errors are retried with exponential
+    backoff; responses that violate the schema are retried by showing the model
+    its own validation errors.
 
     Args:
         client: An Anthropic client.
@@ -71,13 +85,14 @@ def structured_call(client, model: str, content, output_model, max_tokens: int =
     Raises:
         StructuredCallError: The model never produced schema-conforming output.
     """
-    tool = {
-        "name": TOOL_NAME,
-        "description": (output_model.__doc__ or "Record the result.").strip(),
-        "input_schema": output_model.model_json_schema(),
-    }
+    schema = _strict_schema(output_model.model_json_schema())
+    description = (output_model.__doc__ or "").strip()
     if isinstance(content, str):
         content = [{"type": "text", "text": content}]
+    if description:
+        # The schema's docstring used to ride along as the tool description;
+        # with structured outputs it goes in the prompt instead.
+        content = list(content) + [{"type": "text", "text": f"Respond with: {description}"}]
 
     messages = [{"role": "user", "content": content}]
     api_attempt = 0
@@ -88,9 +103,13 @@ def structured_call(client, model: str, content, output_model, max_tokens: int =
             message = client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
-                tools=[tool],
-                tool_choice={"type": "tool", "name": TOOL_NAME},
                 messages=messages,
+                # Sent via extra_body so this works on every SDK version that
+                # callers have pinned (>=0.39), not only those that type-check
+                # `output_config`. The API reads the same body field either way.
+                extra_body={
+                    "output_config": {"format": {"type": "json_schema", "schema": schema}}
+                },
             )
         except TRANSIENT_API_ERRORS as e:
             if api_attempt >= len(RETRY_DELAYS):
@@ -101,9 +120,9 @@ def structured_call(client, model: str, content, output_model, max_tokens: int =
             api_attempt += 1
             continue
 
-        block = next(b for b in message.content if b.type == "tool_use")
+        text = next((b.text for b in message.content if b.type == "text"), "")
         try:
-            return output_model.model_validate(block.input)
+            return output_model.model_validate_json(text)
         except ValidationError as e:
             schema_attempts += 1
             if schema_attempts >= MAX_SCHEMA_ATTEMPTS:
@@ -116,10 +135,8 @@ def structured_call(client, model: str, content, output_model, max_tokens: int =
                     "role": "user",
                     "content": [
                         {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "is_error": True,
-                            "content": f"Validation failed:\n{e}\nCall the tool again with corrected values.",
+                            "type": "text",
+                            "text": f"Validation failed:\n{e}\nRespond again with corrected values.",
                         }
                     ],
                 },

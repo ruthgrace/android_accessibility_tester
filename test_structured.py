@@ -5,8 +5,9 @@ schema types and the structured_call retry/validation logic against a fake
 client.
 """
 
-from typing import Optional
+from typing import List, Optional
 
+import json
 import os
 
 import pytest
@@ -18,16 +19,16 @@ from android_accessibility_tester import (
     Element,
     Result,
     StructuredCallError,
+    _strict_schema,
     structured_call,
 )
 
 
-class FakeToolUse:
-    type = "tool_use"
+class FakeText:
+    type = "text"
 
-    def __init__(self, input, id="tu_1"):
-        self.input = input
-        self.id = id
+    def __init__(self, text):
+        self.text = text
 
 
 class FakeMessage:
@@ -47,12 +48,26 @@ class FakeMessages:
         response = self._responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return FakeMessage([FakeToolUse(response)])
+        return FakeMessage([FakeText(json.dumps(response))])
 
 
 class FakeClient:
     def __init__(self, *responses):
         self.messages = FakeMessages(responses)
+
+
+def _raw_text_then(fake_messages):
+    """Wrap FakeMessages.create so plain-string responses are returned as raw text blocks."""
+
+    def create(**kwargs):
+        fake_messages.calls.append(kwargs)
+        response = fake_messages._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        text = response if isinstance(response, str) else json.dumps(response)
+        return FakeMessage([FakeText(text)])
+
+    return create
 
 
 class Alarm(Result):
@@ -109,30 +124,46 @@ class TestStructuredCall:
         assert result.time == "7:00 AM"
         assert result.enabled is True
 
-    def test_forces_the_output_model_schema_as_a_tool(self):
+    def test_requests_the_output_model_schema_as_structured_output(self):
         client = FakeClient({"ok": True, "time": "7:00 AM", "enabled": True})
 
         structured_call(client, "a-model", "read the alarm", Alarm)
 
         kwargs = client.messages.calls[0]
-        tool = kwargs["tools"][0]
-        assert tool["input_schema"] == Alarm.model_json_schema()
-        assert kwargs["tool_choice"] == {"type": "tool", "name": tool["name"]}
+        fmt = kwargs["extra_body"]["output_config"]["format"]
+        assert fmt["type"] == "json_schema"
+        assert fmt["schema"] == _strict_schema(Alarm.model_json_schema())
+        assert "tools" not in kwargs
+        assert "tool_choice" not in kwargs
 
-    def test_uses_the_model_docstring_as_the_tool_description(self):
+    def test_schema_forbids_additional_properties_on_every_object(self):
+        class Inner(BaseModel):
+            x: int
+
+        class Outer(BaseModel):
+            inner: Inner
+            items: List[Inner]
+
+        schema = _strict_schema(Outer.model_json_schema())
+
+        assert schema["additionalProperties"] is False
+        assert schema["$defs"]["Inner"]["additionalProperties"] is False
+
+    def test_puts_the_model_docstring_in_the_prompt(self):
         client = FakeClient({"ok": True, "time": "7:00 AM", "enabled": True})
 
         structured_call(client, "a-model", "read the alarm", Alarm)
 
-        assert client.messages.calls[0]["tools"][0]["description"] == "An alarm read off the screen."
+        content = client.messages.calls[0]["messages"][0]["content"]
+        assert content[-1] == {"type": "text", "text": "Respond with: An alarm read off the screen."}
 
     def test_wraps_a_plain_string_prompt_as_a_text_block(self):
         client = FakeClient({"ok": True, "time": "7:00 AM", "enabled": True})
 
         structured_call(client, "a-model", "read the alarm", Alarm)
 
-        messages = client.messages.calls[0]["messages"]
-        assert messages == [{"role": "user", "content": [{"type": "text", "text": "read the alarm"}]}]
+        content = client.messages.calls[0]["messages"][0]["content"]
+        assert content[0] == {"type": "text", "text": "read the alarm"}
 
     def test_passes_block_content_through_untouched(self):
         client = FakeClient({"ok": True, "time": "7:00 AM", "enabled": True})
@@ -140,7 +171,8 @@ class TestStructuredCall:
 
         structured_call(client, "a-model", blocks, Alarm)
 
-        assert client.messages.calls[0]["messages"][0]["content"] == blocks
+        assert client.messages.calls[0]["messages"][0]["content"][: len(blocks)] == blocks
+        assert blocks == [{"type": "text", "text": "hi"}]  # caller's list is not mutated
 
     def test_retries_a_schema_violation_and_returns_the_corrected_value(self):
         client = FakeClient(
@@ -162,11 +194,21 @@ class TestStructuredCall:
         structured_call(client, "a-model", "read the alarm", Alarm)
 
         retry_messages = client.messages.calls[1]["messages"]
-        tool_result = retry_messages[-1]["content"][0]
-        assert tool_result["type"] == "tool_result"
-        assert tool_result["tool_use_id"] == "tu_1"
-        assert tool_result["is_error"] is True
-        assert "enabled" in tool_result["content"]
+        assert retry_messages[-2]["role"] == "assistant"
+        correction = retry_messages[-1]["content"][0]
+        assert retry_messages[-1]["role"] == "user"
+        assert correction["type"] == "text"
+        assert "Validation failed" in correction["text"]
+        assert "enabled" in correction["text"]
+
+    def test_treats_non_json_text_as_a_schema_violation(self):
+        client = FakeClient("not json at all", {"ok": True, "time": "7:00 AM", "enabled": True})
+        client.messages.create = _raw_text_then(client.messages)  # pass the string through raw
+
+        result = structured_call(client, "a-model", "read the alarm", Alarm)
+
+        assert result.enabled is True
+        assert len(client.messages.calls) == 2
 
     def test_raises_when_the_schema_never_validates(self):
         client = FakeClient(
