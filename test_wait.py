@@ -263,3 +263,11 @@ class TestExpect:
             pass
 
         assert done
+
+
+class TestLogcatFilter:
+    def test_listens_at_verbose_so_no_level_is_dropped(self):
+        args = Logcat("MyService", "ready").logcat_args()
+
+        assert "MyService:V" in args
+        assert "*:S" in args

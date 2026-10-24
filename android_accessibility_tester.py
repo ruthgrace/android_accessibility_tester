@@ -402,7 +402,7 @@ class Logcat(Condition):
         if self.clear_first:
             subprocess.run(adb_cmd + ["logcat", "-c"], capture_output=True)
         self._proc = subprocess.Popen(
-            adb_cmd + ["logcat", "-v", "brief", f"{self.tag}:D", "*:S"],
+            adb_cmd + self.logcat_args(),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
         )
 
@@ -413,6 +413,10 @@ class Logcat(Condition):
                     return
 
         threading.Thread(target=reader, daemon=True).start()
+
+    def logcat_args(self) -> List[str]:
+        """The logcat invocation: this tag at every level (V and up), all others silenced."""
+        return ["logcat", "-v", "brief", f"{self.tag}:V", "*:S"]
 
     def poll(self, tick):
         if self._matched[0] is not None:

@@ -17,6 +17,8 @@ the wait times out although the app behaved. The README's own example had this o
   including one that reproduces the ordering trap.
 
 **Changed:** README and CLAUDE.md examples use `expect()` wherever the action produces the signal.
+`Logcat` now filters at `tag:V` rather than `tag:D`, so lines logged with `Log.v` are no longer
+dropped. Verified live on a Pixel 8.
 
 # version 4.1.0
 
