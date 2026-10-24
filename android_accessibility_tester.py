@@ -948,21 +948,50 @@ class AndroidAccessibilityTester:
             assert result, result.error
         """
         condition.start(self)
-        started = time.time()
         try:
-            while True:
-                tick = Tick(self)
-                try:
-                    result = condition.poll(tick)
-                    if result:
-                        return result
-                    if time.time() - started >= timeout:
-                        return condition.timeout(tick, timeout)
-                finally:
-                    tick.release()
-                time.sleep(poll_interval)
+            return self._poll_until(condition, timeout, poll_interval)
         finally:
             condition.stop(self)
+
+    def expect(self, condition, timeout: float = 10.0, poll_interval: float = 0.5) -> "Expectation":
+        """Arm a condition before an action, then wait for it after.
+
+        Use this instead of act-then-wait_for when the action itself produces the
+        signal. `Logcat` clears the log buffer when it starts listening, so if the
+        app logs the line before `wait_for` is reached, the line is wiped and the
+        wait times out. `expect` starts listening on entry, runs the body, and waits
+        on exit, so anything the body triggers is guaranteed to be seen while
+        anything older is still cleared.
+
+        If the body raises, the condition is torn down without waiting and the
+        exception propagates.
+
+        Returns:
+            Expectation — truthy after the block if the condition was met; `.error`
+            explains a timeout. Fields of the underlying Result (e.g. `.line`) are
+            available on it directly.
+
+        Example:
+            with tester.expect(Logcat("MyService", "overlay created"), timeout=30) as done:
+                tester.act("tap the Start button")
+            assert done
+        """
+        return Expectation(self, condition, timeout, poll_interval)
+
+    def _poll_until(self, condition, timeout: float, poll_interval: float) -> Result:
+        """Poll an already-started condition until it fires or `timeout` elapses."""
+        started = time.time()
+        while True:
+            tick = Tick(self)
+            try:
+                result = condition.poll(tick)
+                if result:
+                    return result
+                if time.time() - started >= timeout:
+                    return condition.timeout(tick, timeout)
+            finally:
+                tick.release()
+            time.sleep(poll_interval)
 
 
     def save_debug_artifacts(self, output_dir: str, test_name: str, step_name: str,
@@ -1032,6 +1061,53 @@ class AndroidAccessibilityTester:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"adb pull {remote_path} failed: {result.stderr.strip()}")
+
+class Expectation:
+    """The handle returned by `tester.expect()`.
+
+    Starts its condition on entry and waits for it on exit. Afterwards it is truthy
+    if the condition was met, and forwards attribute access to the underlying Result
+    so `.error`, `.line`, `.final_color` etc. read as they would from `wait_for()`.
+    """
+
+    def __init__(self, tester, condition, timeout: float, poll_interval: float):
+        self._tester = tester
+        self._condition = condition
+        self._timeout = timeout
+        self._poll_interval = poll_interval
+        self.result: Optional[Result] = None
+
+    def __enter__(self):
+        self._condition.start(self._tester)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self.result = self._tester._poll_until(
+                    self._condition, self._timeout, self._poll_interval
+                )
+        finally:
+            self._condition.stop(self._tester)
+        return False
+
+    def __bool__(self):
+        return bool(self.result)
+
+    def __getattr__(self, name):
+        # Only called when normal lookup fails, so the Expectation's own attributes win.
+        result = self.__dict__.get("result")
+        if result is None:
+            raise AttributeError(
+                f"{name!r} is not available until the `with tester.expect(...)` block has exited"
+            )
+        return getattr(result, name)
+
+    def __repr__(self):
+        if self.result is None:
+            return f"Expectation(pending: {self._condition.describe()})"
+        return f"Expectation({self.result!r})"
+
 
 class Capture:
     """A screenshot of the device at one moment, held for later comparison.

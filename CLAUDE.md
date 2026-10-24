@@ -133,6 +133,24 @@ assert tester.wait_for(Logcat("MyService", "upload finished"), timeout=30)
 assert tester.wait_for(AnyOf(Logcat("Overlay", "created"), PixelChanged(300, 1380)))
 ```
 
+**expect(condition, timeout=10.0, poll_interval=0.5) → Expectation**
+
+`wait_for` for signals the action itself produces. It arms the condition on entry, runs the
+body, and waits on exit. After the block the `Expectation` is truthy if the condition was met
+and forwards `.error`, `.line`, `.final_color` and so on from the underlying `Result`.
+
+```python
+with tester.expect(Logcat("MyService", "overlay created"), timeout=30) as created:
+    tester.act("tap the Start button")
+assert created
+```
+
+Why this exists: `Logcat` clears the log buffer when it starts listening, so stale lines from
+an earlier test cannot produce a false pass. With act-then-`wait_for`, that clear runs *after*
+the tap. A fast service logs its line in the gap, the clear wipes it, and the wait times out
+even though the app did the right thing. `expect` puts the clear before the tap. If the body
+raises, the condition is torn down without waiting and the exception propagates.
+
 There are no element-based conditions: every way of reading the hierarchy either disturbs the
 app under test or is unreliable. See the constraint section below.
 
@@ -167,7 +185,9 @@ For an app you control, `Logcat` is usually the strongest option — it is exact
 model call, and disturbs nothing:
 
 ```python
-assert tester.wait_for(Logcat("MyAccessibilityService", "overlay created"), timeout=30)
+with tester.expect(Logcat("MyAccessibilityService", "overlay created"), timeout=30) as created:
+    tester.act("tap the Start button")
+assert created
 ```
 
 ### Options if you need a real hierarchy
@@ -239,7 +259,8 @@ export ANTHROPIC_API_KEY=your_api_key_here
 ./venv/bin/pytest example_test.py
 ```
 
-Unit tests for the framework itself need no device or API key:
+Unit tests for the framework itself need no device or API key. The `Logcat` tests run the
+real subprocess code against a fake `adb` script placed on `PATH`, backed by a plain file:
 
 ```bash
 ./venv/bin/pytest test_structured.py test_wait.py test_act.py test_failure_artifacts.py
@@ -259,8 +280,9 @@ def tester():
     yield tester
 
 def test_my_feature(tester):
-    assert tester.act("tap the Start button")
-    assert tester.wait_for(Logcat("MyService", "load complete"), timeout=30)
+    with tester.expect(Logcat("MyService", "load complete"), timeout=30) as loaded:
+        assert tester.act("tap the Start button")
+    assert loaded
     assert tester.check("the results list is showing with at least one row")
 ```
 

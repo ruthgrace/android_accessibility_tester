@@ -29,10 +29,15 @@ from android_accessibility_tester import AndroidAccessibilityTester, Logcat
 tester = AndroidAccessibilityTester()
 tester.open_app("com.example.myapp")
 
-assert tester.act("tap the Start button")                          # find and tap
-assert tester.wait_for(Logcat("MyService", "load complete"), timeout=30)
+with tester.expect(Logcat("MyService", "load complete"), timeout=30) as loaded:
+    assert tester.act("tap the Start button")                      # find and tap
+assert loaded                                                      # the line arrived
 assert tester.check("the results list is showing with at least one row")
 ```
+
+`expect()` starts listening *before* the action and waits *after* it. Use it whenever the
+action is what produces the signal. Plain `wait_for()` is for signals that will arrive on
+their own.
 
 `observe()` locates an element and returns it *without* acting. Cache that result and `act()`
 on it to replay the tap with no further model calls — this is the droidrun-and-hardcode

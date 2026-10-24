@@ -143,3 +143,123 @@ class TestWaitForContract:
         result = tester.wait_for(PixelColor(5, 5, "#00ff00"), **FAST)
 
         assert isinstance(result, Result)
+
+
+# --- Logcat against a fake adb -------------------------------------------------
+#
+# These exercise the real Logcat subprocess code. A fake `adb` script on PATH
+# backs logcat with a plain file: `logcat -c` truncates it, and the streaming
+# `logcat` form tails it. Appending to the file stands in for the app logging.
+
+FAKE_ADB = r"""#!/bin/bash
+case "$1 $2" in
+  "version ") echo "Android Debug Bridge version 0.0 (fake)";;
+  "logcat -c") : > "$FAKE_LOGCAT_BUFFER";;
+  "logcat -v") exec tail -n +1 -f "$FAKE_LOGCAT_BUFFER";;
+  *) echo "fake adb: unexpected args: $*" >&2; exit 1;;
+esac
+"""
+
+
+@pytest.fixture
+def logcat_tester(tmp_path, monkeypatch):
+    """A real tester whose `adb` is a script backed by a log buffer file."""
+    import os
+    import stat
+    from android_accessibility_tester import AndroidAccessibilityTester
+
+    buffer = tmp_path / "logcat.txt"
+    buffer.write_text("")
+    adb = tmp_path / "adb"
+    adb.write_text(FAKE_ADB)
+    adb.chmod(adb.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_LOGCAT_BUFFER", str(buffer))
+    monkeypatch.setattr(AndroidAccessibilityTester, "_resolve_default_model", lambda self: "test-model")
+
+    t = AndroidAccessibilityTester(api_key="not-a-real-key")
+    t.log_buffer = buffer
+
+    def log(line):
+        with open(buffer, "a") as f:
+            f.write(line + "\n")
+
+    t.log = log
+    return t
+
+
+class TestLogcatCondition:
+    def test_sees_a_line_logged_while_waiting(self, logcat_tester):
+        import threading
+        t = logcat_tester
+        threading.Timer(0.1, t.log, args=["D/MyService( 123): overlay created"]).start()
+
+        result = t.wait_for(Logcat("MyService", "overlay created"), timeout=2, poll_interval=0.02)
+
+        assert result
+        assert "overlay created" in result.line
+
+    def test_times_out_when_the_line_never_arrives(self, logcat_tester):
+        result = logcat_tester.wait_for(Logcat("MyService", "never"), timeout=0.2, poll_interval=0.02)
+
+        assert not result
+        assert "never" in result.error
+
+    def test_wait_for_misses_a_line_logged_before_it_starts(self, logcat_tester):
+        """Documents the trap: act-then-wait clears the line the act produced."""
+        t = logcat_tester
+        t.log("D/MyService( 123): overlay created")   # the app logs during act()
+
+        result = t.wait_for(Logcat("MyService", "overlay created"), timeout=0.2, poll_interval=0.02)
+
+        assert not result
+
+
+class TestExpect:
+    def test_sees_a_line_logged_inside_the_block(self, logcat_tester):
+        t = logcat_tester
+
+        with t.expect(Logcat("MyService", "overlay created"), timeout=2, poll_interval=0.02) as done:
+            t.log("D/MyService( 123): overlay created")
+
+        assert done
+        assert "overlay created" in done.line
+
+    def test_ignores_stale_lines_from_before_the_block(self, logcat_tester):
+        t = logcat_tester
+        t.log("D/MyService( 123): overlay created")   # left over from an earlier test
+
+        with t.expect(Logcat("MyService", "overlay created"), timeout=0.2, poll_interval=0.02) as done:
+            pass
+
+        assert not done
+        assert "overlay created" in done.error
+
+    def test_exposes_the_result_fields(self, logcat_tester):
+        t = logcat_tester
+
+        with t.expect(Logcat("MyService", "ready"), timeout=0.2, poll_interval=0.02) as done:
+            pass
+
+        assert done.ok is False
+        assert isinstance(done.result, Result)
+        assert "ready" in repr(done)
+
+    def test_does_not_wait_when_the_body_raises(self, logcat_tester):
+        import time
+        t = logcat_tester
+        started = time.time()
+
+        with pytest.raises(KeyError):
+            with t.expect(Logcat("MyService", "never"), timeout=5, poll_interval=0.02):
+                raise KeyError("boom")
+
+        assert time.time() - started < 1
+
+    def test_works_with_pixel_conditions_too(self, tester):
+        tester.colors = [(255, 0, 0), (0, 255, 0)]
+
+        with tester.expect(PixelColor(5, 5, "#00ff00"), **FAST) as done:
+            pass
+
+        assert done

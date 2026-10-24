@@ -1,3 +1,23 @@
+# version 4.2.0
+
+**Adds `expect()`, and fixes the act-then-`wait_for(Logcat(...))` pattern the docs recommended.**
+
+`Logcat` runs `logcat -c` when it starts listening, so a stale line from an earlier test cannot
+produce a false pass. But `wait_for` starts the condition *after* the preceding `act()`, so a
+service that logs quickly has its line wiped by the clear before the reader is attached, and
+the wait times out although the app behaved. The README's own example had this ordering.
+
+**Added:**
+
+* `tester.expect(condition, timeout, poll_interval)` — a context manager that arms the condition
+  on entry, runs the body, and waits on exit. The returned `Expectation` is truthy when the
+  condition was met and forwards the underlying `Result`'s fields (`.error`, `.line`, …). If the
+  body raises, the condition is stopped without waiting and the exception propagates.
+* Unit tests that drive the real `Logcat` subprocess code through a fake `adb` script on `PATH`,
+  including one that reproduces the ordering trap.
+
+**Changed:** README and CLAUDE.md examples use `expect()` wherever the action produces the signal.
+
 # version 4.1.0
 
 **Structured outputs replace forced tool use.** `structured_call` now asks for JSON via
