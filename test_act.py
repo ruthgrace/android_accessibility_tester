@@ -41,7 +41,7 @@ class TestActFromDescription:
         assert tester.taps == [(200, 240)]
 
     def test_returns_a_falsy_result_when_the_element_is_not_found(self, tester):
-        tester.client = FakeClient({"found": False, "explanation": "no Start button on screen"})
+        tester.client = FakeClient({"found": False, "bounds": "", "explanation": "no Start button on screen"})
 
         result = tester.act("tap the Start button")
 
@@ -91,3 +91,33 @@ class TestActReplay:
         tester.act(cached)
 
         assert shots == []
+
+
+class TestElementSchema:
+    """The schema is what the model is held to, so it must carry the bounds rule itself."""
+
+    def schema(self):
+        from android_accessibility_tester import _strict_schema
+        return _strict_schema(Element.model_json_schema())
+
+    def test_bounds_is_required_and_comes_before_the_explanation(self):
+        schema = self.schema()
+
+        assert "bounds" in schema["required"]
+        keys = list(schema["properties"])
+        assert keys.index("bounds") < keys.index("explanation")
+
+    def test_has_no_hierarchy_selector_fields(self):
+        assert not {"resource_id", "content_desc", "text"} & set(self.schema()["properties"])
+
+    def test_not_found_carries_empty_bounds(self):
+        el = Element(found=False, bounds="", explanation="nothing like it on screen")
+
+        assert not el.found
+        assert "nothing like it" in repr(el)
+
+    def test_found_requires_well_formed_bounds(self):
+        with pytest.raises(ValueError):
+            Element(found=True, bounds="", explanation="x")
+        with pytest.raises(ValueError):
+            Element(found=True, bounds="100,200,300,400", explanation="x")

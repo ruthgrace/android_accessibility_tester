@@ -306,24 +306,20 @@ class Element(BaseModel):
     """The location of a UI element on screen."""
 
     found: bool = Field(description="Whether an element matching the description was found.")
-    bounds: Optional[str] = Field(
-        default=None,
+    bounds: str = Field(
         description=(
-            'The element\'s bounding box as pixel coordinates in the image, in the form '
-            '"[x1,y1][x2,y2]". Required when found is true.'
+            'The element\'s bounding box as pixel coordinates in the image, exactly in the form '
+            '"[x1,y1][x2,y2]". This is the only place coordinates go. Empty string if found is false.'
         ),
     )
-    explanation: str = Field(description="One sentence on why this element matches, or why none does.")
-    resource_id: Optional[str] = Field(default=None, description="The matched element's resource_id, if it has one.")
-    content_desc: Optional[str] = Field(default=None, description="The matched element's content_desc, if it has one.")
-    text: Optional[str] = Field(default=None, description="The matched element's text, if it has any.")
+    explanation: str = Field(
+        description="Under 20 words: which element this is, or why none matches. No coordinates here.",
+    )
 
     @model_validator(mode="after")
     def _check_bounds(self):
-        if self.found and not self.bounds:
-            raise ValueError("bounds is required when found is true")
-        if self.bounds and not BOUNDS_RE.fullmatch(self.bounds):
-            raise ValueError(f'bounds must match "[x1,y1][x2,y2]", got {self.bounds!r}')
+        if self.found and not BOUNDS_RE.fullmatch(self.bounds or ""):
+            raise ValueError(f'bounds must match "[x1,y1][x2,y2]" when found is true, got {self.bounds!r}')
         return self
 
     def box(self) -> Tuple[int, int, int, int]:
@@ -338,7 +334,7 @@ class Element(BaseModel):
     def __repr__(self):
         if not self.found:
             return f"Element(found=False): {self.explanation}"
-        return f"Element({self.bounds}, resource_id={self.resource_id!r})"
+        return f"Element({self.bounds})"
 
 
 class ActResult(Result):
@@ -817,11 +813,10 @@ class AndroidAccessibilityTester:
 
     @timing
     def observe(self, description: str, model: Optional[str] = None) -> Optional[Element]:
-        """Locate an element in the accessibility hierarchy, without acting on it.
+        """Locate an element on screen, without acting on it.
 
-        The returned Element carries selectors (resource_id, content_desc, text) as well
-        as bounds, so it can be cached by the caller and replayed later without another
-        model call.
+        The returned Element carries bounds in device pixels, so it can be cached by the
+        caller and replayed with act() later without another model call.
 
         Args:
             description: Description of the element to find.
@@ -866,7 +861,7 @@ class AndroidAccessibilityTester:
                 ],
                 Element,
                 model=model,
-                max_tokens=500,
+                max_tokens=600,
             )
             if element.found and scale < 1.0:
                 x1, y1, x2, y2 = (round(v / scale) for v in element.box())

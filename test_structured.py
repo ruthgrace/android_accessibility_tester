@@ -281,20 +281,9 @@ class TestElement:
         with pytest.raises(ValidationError, match="bounds"):
             Element(found=True, bounds="10,20,30,60", explanation="wrong format")
 
-    def test_not_found_needs_no_bounds(self):
-        e = Element(found=False, explanation="no element matches")
-        assert e.bounds is None
-
-    def test_carries_selectors_so_the_element_can_be_replayed_without_an_llm(self):
-        e = Element(
-            found=True,
-            bounds="[0,0][10,10]",
-            explanation="x",
-            resource_id="start_button",
-            content_desc="Start",
-            text="Start",
-        )
-        assert (e.resource_id, e.content_desc, e.text) == ("start_button", "Start", "Start")
+    def test_not_found_carries_empty_bounds(self):
+        e = Element(found=False, bounds="", explanation="no element matches")
+        assert e.bounds == ""
 
 
 @pytest.fixture
@@ -368,22 +357,20 @@ class TestCheckMethod:
 class TestObserve:
     def test_returns_an_element_with_a_usable_center(self, tester):
         tester.client = FakeClient(
-            {"found": True, "bounds": "[100,200][300,280]", "explanation": "the Start button",
-             "resource_id": "start_button"}
+            {"found": True, "bounds": "[100,200][300,280]", "explanation": "the Start button"}
         )
 
         element = tester.observe("the Start button")
 
         assert element.center() == (200, 240)
-        assert element.resource_id == "start_button"
 
     def test_returns_none_when_nothing_matches(self, tester):
-        tester.client = FakeClient({"found": False, "explanation": "no such element"})
+        tester.client = FakeClient({"found": False, "bounds": "", "explanation": "no such element"})
 
         assert tester.observe("a nonexistent widget") is None
 
     def test_sends_a_screenshot_and_the_description(self, tester):
-        tester.client = FakeClient({"found": False, "explanation": "no"})
+        tester.client = FakeClient({"found": False, "bounds": "", "explanation": "no"})
 
         tester.observe("the Start button")
 

@@ -13,8 +13,6 @@ def show(label, element):
         print(f"Found {label}!")
         print(f"Bounds: {element.bounds}")
         print(f"Center: {element.center()}")
-        print(f"Selectors: resource_id={element.resource_id!r}, "
-              f"content_desc={element.content_desc!r}, text={element.text!r}")
         print(f"Explanation: {element.explanation}")
     else:
         print(f"{label} not found!")

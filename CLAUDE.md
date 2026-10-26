@@ -38,8 +38,8 @@ Model resolution when `model=None`: `SCREEN_AGENT_MODEL` env override → newest
 Every outcome-carrying method returns a `Result`: truthy when `ok`, with `.error` holding one sentence explaining failure. Its `__repr__` leads with that sentence, so a bare `assert` produces a useful pytest message.
 
 ```python
-result = tester.wait_for(ElementGone(resource_id="spinner"), timeout=30)
-assert result            # on failure: "ElementGone(ok=False): Timeout after 30s - ..."
+result = tester.wait_for(Logcat("MyService", "ready"), timeout=30)
+assert result            # on failure: "LogcatResult(ok=False): Timeout after 30s - ..."
 ```
 
 Subclasses add diagnostics: `Check.screenshot`, `PixelResult.initial_color` / `.final_color`, `LogcatResult.line`, `ActResult.element`.

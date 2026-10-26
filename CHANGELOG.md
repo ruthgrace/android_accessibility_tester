@@ -1,3 +1,24 @@
+# version 4.3.1
+
+**`Element`'s schema now carries the bounds rule itself.** Sonnet 4.6 failed schema validation on
+about one `observe()` call in six: it either left `bounds` out and narrated the coordinates in
+`explanation`, or wrote an explanation long enough to be cut off by the token cap. The schema
+sent to the model said `bounds` was optional; only a pydantic validator on our side disagreed.
+
+**Changed:**
+
+* `bounds` is a required string, empty when `found` is false, and comes before `explanation` so
+  the coordinates are emitted first. `explanation` is capped at twenty words by its description
+  and told to carry no coordinates. The response token cap rises from 500 to 600.
+* `resource_id`, `content_desc` and `text` are removed from `Element`. They dated from the
+  hierarchy era, could only be invented from a screenshot, and have been `None` since 4.0.0.
+
+Offline, with `calibration/measure.py`: Sonnet 4.6 schema errors 9 → 0 and hits 27 → 36 of 42;
+Sonnet 5.5 unchanged at 0 errors, 35 → 37 hits. The remaining misses are the same ambiguous
+Timers labels in every run.
+
+No change to how `observe()` or `act()` are called.
+
 # version 4.3.0
 
 **`observe()` now resizes the screenshot before sending it, and scales the answer back.**
