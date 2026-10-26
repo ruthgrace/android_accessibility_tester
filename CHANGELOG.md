@@ -1,3 +1,20 @@
+# version 4.3.2
+
+**`observe()` prefers a tappable control over a text label when a description fits both.**
+`observe()` exists to feed `act()`, which taps, so when "the Start timer" could mean the title
+text or the play button beside it, the button is almost always what the test wants. A test that
+wants the label can say "the text label".
+
+**Changed:** `calibration/measure.py` now uses a curated target table with descriptions written
+the way a test author would write them, using the words visible on screen, instead of generating
+descriptions from hierarchy labels. The hierarchy's "8 minutes timer" is "8m Timer" on screen,
+and its label and buttons shared words, which produced misses that were not coordinate errors.
+The bedtime fixture was captured mid-transition and lists controls the image does not show;
+only its chrome is used until it is recaptured.
+
+Result, both models: 42 hits of 42, no schema errors, nothing unfound. Median error 5 px on
+Sonnet 5.5 and 25 px on Sonnet 4.6.
+
 # version 4.3.1
 
 **`Element`'s schema now carries the bounds rule itself.** Sonnet 4.6 failed schema validation on

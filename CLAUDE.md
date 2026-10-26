@@ -321,15 +321,16 @@ a known scale, the prompt tells the model the image's dimensions, and the return
 divided by the scale back into device pixels. Screenshots already under the cap are sent as is.
 `check()` and `extract()` send the raw screenshot, since they report on content, not position.
 
-Measured offline on six Clock screens (42 visible targets, scored against `uiautomator` dumps):
+Measured offline on five Clock screens, 42 controls described the way a test author would
+write them, scored against `uiautomator` dumps:
 
 | Model | Raw screenshot | Resized, scaled back |
 |---|---|---|
-| Sonnet 5.5 | 35 hits, median 3 px | 35 hits, median 5 px |
-| Sonnet 4.6 | 0 hits, median 606 px | 27 hits, median 26 px |
+| Sonnet 5.5 | 35 hits of 42, median 3 px | 42 of 42, median 5 px |
+| Sonnet 4.6 | 0 hits of 42, median 606 px | 42 of 42, median 25 px |
 
-The remaining misses are the same controls every run, where the hierarchy label is ambiguous
-(a Timers card and its start button), not coordinate errors.
+(The raw-screenshot column was measured with auto-generated descriptions, under which 5.5's
+misses were ambiguous labels rather than coordinate errors.)
 
 Coordinate rulers in a margin around the screenshot were also tried (`add_rulers()`, kept and
 tested). They did not help Sonnet 5.5 and made Sonnet 4.6 worse: it read the vertical ruler

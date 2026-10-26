@@ -111,6 +111,15 @@ class TestObserveResizes:
         assert abs(w / h - 1080 / 2400) < 0.01          # aspect ratio preserved
         assert f"{w}x{h}" in prompt                     # the model is told what it is looking at
 
+    def test_prefers_a_control_over_a_label_when_the_description_fits_both(self, tester):
+        from test_structured import FakeClient
+        tester.client = FakeClient({"found": True, "bounds": "[0,0][10,10]", "explanation": "x"})
+
+        tester.observe("the thing")
+
+        _, prompt = self.sent_image(tester)
+        assert "tappable control" in prompt and "label" in prompt
+
     def test_scales_bounds_back_to_device_pixels(self, tester):
         from test_structured import FakeClient
         # 1080x2400 shrinks by 0.666; the model answers in the shrunken image's pixels.

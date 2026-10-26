@@ -855,7 +855,10 @@ class AndroidAccessibilityTester:
                             f"Element description: {description}\n\n"
                             f"The image is {w}x{h} pixels. Report the element's bounds as "
                             "pixel coordinates in this image, in the form [x1,y1][x2,y2]. "
-                            "Be precise: the centre of these bounds is where the tap will land."
+                            "Be precise: the centre of these bounds is where the tap will land.\n\n"
+                            "If the description fits both a static text label and a tappable "
+                            "control (a button, switch, icon or row), choose the tappable control "
+                            "unless the description asks for the label itself."
                         ),
                     },
                 ],
