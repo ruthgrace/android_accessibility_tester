@@ -84,7 +84,9 @@ Field docstrings and `Field(description=...)` are what steer the model — they 
 
 **observe(description, model=None) → Element | None**
 
-Finds an element in the accessibility hierarchy without acting on it. The returned `Element` carries selectors (`resource_id`, `content_desc`, `text`) as well as `bounds`, so it can be cached by the caller and replayed later.
+Finds an element on screen without acting on it. The screenshot is read visually; nothing
+touches the UI hierarchy. The returned `Element` carries `bounds` in device pixels, so it can be
+cached by the caller and replayed later.
 
 ```python
 start = tester.observe("the Start Timer button")
@@ -96,7 +98,7 @@ if start:
 
 **act(target, model=None) → ActResult**
 
-Taps an element. Given a string, locates it with `observe()` (one model call). Given a cached `Element`, re-resolves it against the current hierarchy with **no model call**, falling back to the model only if its selectors are gone.
+Taps an element. Given a string, locates it with `observe()` (one model call). Given a cached `Element`, replays its coordinates with **no model call**.
 
 ```python
 assert tester.act("tap the Start Timer button")
@@ -263,7 +265,7 @@ Unit tests for the framework itself need no device or API key. The `Logcat` test
 real subprocess code against a fake `adb` script placed on `PATH`, backed by a plain file:
 
 ```bash
-./venv/bin/pytest test_structured.py test_wait.py test_act.py test_failure_artifacts.py
+./venv/bin/pytest test_structured.py test_wait.py test_act.py test_failure_artifacts.py test_images.py
 ```
 
 ## Example Test Structure
@@ -307,6 +309,34 @@ Note that pydantic's default lax mode coerces some values — `"yes"`, `"on"` an
 ### Screenshot Workflow
 
 Device captures to `/sdcard/screenshot.png`, ADB pulls to the local path, the device file is removed (failure ignored — scoped storage may block `rm`).
+
+### Screenshot Scaling
+
+The API shrinks any image over about 1.15 megapixels before the model sees it, and a phone
+screenshot is well over that. Some models then answer in the shrunken image's coordinates: on a
+1080x2400 Pixel 8, Sonnet 4.6 returned every position scaled by 0.666, so no tap landed.
+
+So `observe()` does the shrinking itself. `fit_for_model()` resizes the screenshot to the cap at
+a known scale, the prompt tells the model the image's dimensions, and the returned bounds are
+divided by the scale back into device pixels. Screenshots already under the cap are sent as is.
+`check()` and `extract()` send the raw screenshot, since they report on content, not position.
+
+Measured offline on six Clock screens (42 visible targets, scored against `uiautomator` dumps):
+
+| Model | Raw screenshot | Resized, scaled back |
+|---|---|---|
+| Sonnet 5.5 | 35 hits, median 3 px | 35 hits, median 5 px |
+| Sonnet 4.6 | 0 hits, median 606 px | 27 hits, median 26 px |
+
+The remaining misses are the same controls every run, where the hierarchy label is ambiguous
+(a Timers card and its start button), not coordinate errors.
+
+Coordinate rulers in a margin around the screenshot were also tried (`add_rulers()`, kept and
+tested). They did not help Sonnet 5.5 and made Sonnet 4.6 worse: it read the vertical ruler
+loosely and ignored the horizontal one. They are not used.
+
+`calibration/pixel8/` holds the screenshots and dumps; `calibration/measure.py` reruns the
+measurement for any model, with no device, so a model change can be checked before it ships.
 
 ## Tips & Best Practices
 

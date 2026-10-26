@@ -1,3 +1,26 @@
+# version 4.3.0
+
+**`observe()` now resizes the screenshot before sending it, and scales the answer back.**
+
+The API shrinks images over ~1.15 megapixels before the model sees them, and some models then
+report coordinates in the shrunken image. On a 1080x2400 Pixel 8, Sonnet 4.6 returned every
+position scaled by 0.666 — zero taps landed. Sonnet 5.5 was unaffected.
+
+**Changed:**
+
+* `fit_for_model(path)` resizes a screenshot to the cap at a known scale and returns the image
+  block plus that scale. `observe()` sends the resized image, names its dimensions in the prompt,
+  and divides the returned bounds by the scale. Screenshots under the cap are sent unchanged.
+  Offline, Sonnet 4.6 goes from 0 to 27 hits out of 42; Sonnet 5.5 is unchanged at 35.
+* `Element`'s field descriptions no longer refer to a hierarchy that was removed in 4.0.0.
+
+**Added:**
+
+* `add_rulers(path)` draws labelled coordinate rulers in a margin around a screenshot. Tested,
+  but not used by `observe()`: measured, it did not help Sonnet 5.5 and hurt Sonnet 4.6.
+* `calibration/pixel8/` — six Clock-app screenshots with matching `uiautomator` dumps — and
+  `calibration/measure.py`, which scores `observe()` against them for any model without a device.
+
 # version 4.2.0
 
 **Adds `expect()`, and fixes the act-then-`wait_for(Logcat(...))` pattern the docs recommended.**

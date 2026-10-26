@@ -19,8 +19,8 @@ def tester(monkeypatch):
         raise AssertionError(f"nothing on the happy path may shell out: {command!r}")
 
     def fake_screenshot(path):
-        with open(path, "wb") as f:
-            f.write(b"\x89PNG\r\n\x1a\nfake")
+        from PIL import Image
+        Image.new("RGB", (40, 60), "gray").save(path)   # observe() frames it with rulers
         return path
 
     monkeypatch.setattr(t, "shell", fake_shell)

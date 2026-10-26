@@ -8,6 +8,7 @@ and Claude LLM for visual assertions.
 import os
 import subprocess
 import base64
+import io
 import json
 import re
 import time
@@ -19,9 +20,9 @@ from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_valid
 from anthropic import Anthropic
 from anthropic import APITimeoutError, APIConnectionError, RateLimitError, InternalServerError
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw, ImageFont
 except ImportError:
-    Image = None
+    Image = ImageDraw = ImageFont = None
 
 
 def timing(f):
@@ -57,6 +58,119 @@ def _strict_schema(schema):
     if isinstance(schema, list):
         return [_strict_schema(v) for v in schema]
     return schema
+
+
+# The API shrinks any image over this many pixels before the model sees it. Some models
+# then answer in the shrunken image's coordinates, so observe() does the shrinking itself
+# at a known scale and maps the answer back. Measured on a Pixel 8: see CLAUDE.md.
+MODEL_IMAGE_MAX_PIXELS = 1_150_000
+
+
+def fit_for_model(screenshot_path: str) -> Tuple[dict, float]:
+    """Return an image content block no larger than the API cap, and the scale applied.
+
+    A screenshot already under the cap is sent unchanged with scale 1.0. Coordinates
+    the model reports against the sent image divide by the scale to give device pixels.
+    """
+    if Image is None:
+        raise RuntimeError("PIL/Pillow is required. Install with: pip install Pillow")
+    with Image.open(screenshot_path) as im:
+        im = im.convert("RGB")
+        w, h = im.size
+        scale = min(1.0, (MODEL_IMAGE_MAX_PIXELS / (w * h)) ** 0.5)
+        if scale < 1.0:
+            im = im.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "PNG")
+        size = im.size
+    data = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+    block = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}
+    block["_size"] = size   # stripped before sending; lets the prompt name the dimensions
+    return block, scale
+
+
+RULER_MARGIN = 72          # pixels of white border on each side of the screenshot
+RULER_MINOR = 100          # tick every N device pixels
+RULER_MAJOR = 200          # labelled tick every N device pixels
+_FONT_CANDIDATES = [
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+]
+
+
+def _ruler_font(size: int):
+    for path in _FONT_CANDIDATES:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                continue
+    return ImageFont.load_default(size=size)
+
+
+def add_rulers(screenshot_path: str, output_path: Optional[str] = None) -> str:
+    """Frame a screenshot with coordinate rulers and return the new image's path.
+
+    Not used by observe(): measured on a Pixel 8, rulers did not improve accuracy for
+    Sonnet 5.5 and made Sonnet 4.6 worse (see CLAUDE.md). Kept, tested, for experiments.
+
+    The screenshot is pasted, untouched, onto a white canvas RULER_MARGIN pixels
+    larger on every side. Along all four edges of that margin are tick marks every
+    RULER_MINOR device pixels, with the device coordinate written beside every
+    RULER_MAJOR tick. The labels are *screen* coordinates, so a model that reads a
+    position off the ruler reports a number the tap can use directly — however the
+    API later rescales the image, the numbers travel with it.
+
+    The margin is deliberately empty apart from the rulers: nothing is drawn over the
+    app itself.
+    """
+    if Image is None:
+        raise RuntimeError("PIL/Pillow is required for rulers. Install with: pip install Pillow")
+    if output_path is None:
+        root, _ = os.path.splitext(screenshot_path)
+        output_path = f"{root}_rulers.png"
+
+    m = RULER_MARGIN
+    with Image.open(screenshot_path) as shot:
+        shot = shot.convert("RGB")
+        w, h = shot.size
+        canvas = Image.new("RGB", (w + 2 * m, h + 2 * m), "white")
+        canvas.paste(shot, (m, m))
+
+    draw = ImageDraw.Draw(canvas)
+    font = _ruler_font(28)
+    ink = "black"
+    minor_len, major_len = 8, 16
+
+    def tick_and_label(coord, horizontal):
+        major = coord % RULER_MAJOR == 0
+        length = major_len if major else minor_len
+        label = str(coord)
+        if horizontal:
+            x = m + coord
+            draw.line([(x, m - length), (x, m - 1)], fill=ink, width=2)          # top
+            draw.line([(x, m + h), (x, m + h + length - 1)], fill=ink, width=2)  # bottom
+            if major:
+                draw.text((x, m - length - 4), label, fill=ink, font=font, anchor="ms")
+                draw.text((x, m + h + length + 4), label, fill=ink, font=font, anchor="mt")
+        else:
+            y = m + coord
+            draw.line([(m - length, y), (m - 1, y)], fill=ink, width=2)          # left
+            draw.line([(m + w, y), (m + w + length - 1, y)], fill=ink, width=2)  # right
+            if major:
+                draw.text((m - length - 4, y), label, fill=ink, font=font, anchor="rm")
+                draw.text((m + w + length + 4, y), label, fill=ink, font=font, anchor="lm")
+
+    for x in range(0, w, RULER_MINOR):
+        tick_and_label(x, horizontal=True)
+    for y in range(0, h, RULER_MINOR):
+        tick_and_label(y, horizontal=False)
+
+    canvas.save(output_path)
+    return output_path
 
 
 class StructuredCallError(RuntimeError):
@@ -189,12 +303,15 @@ class Check(Result):
 
 
 class Element(BaseModel):
-    """The location of a UI element within the accessibility hierarchy."""
+    """The location of a UI element on screen."""
 
     found: bool = Field(description="Whether an element matching the description was found.")
     bounds: Optional[str] = Field(
         default=None,
-        description='Copied EXACTLY from the hierarchy, in the form "[x1,y1][x2,y2]". Required when found is true.',
+        description=(
+            'The element\'s bounding box as pixel coordinates in the image, in the form '
+            '"[x1,y1][x2,y2]". Required when found is true.'
+        ),
     )
     explanation: str = Field(description="One sentence on why this element matches, or why none does.")
     resource_id: Optional[str] = Field(default=None, description="The matched element's resource_id, if it has one.")
@@ -731,17 +848,19 @@ class AndroidAccessibilityTester:
         os.close(fd)
         try:
             self.screenshot(path)
-            return self._structured_call(
+            image, scale = fit_for_model(path)
+            w, h = image.pop("_size")
+            element = self._structured_call(
                 [
-                    self._image_block(path),
+                    image,
                     {
                         "type": "text",
                         "text": (
                             "Find a specific element in this Android screenshot.\n\n"
                             f"Element description: {description}\n\n"
-                            "Report its bounds as pixel coordinates in the screenshot, in "
-                            "the form [x1,y1][x2,y2]. Be precise: the centre of these "
-                            "bounds is where the tap will land."
+                            f"The image is {w}x{h} pixels. Report the element's bounds as "
+                            "pixel coordinates in this image, in the form [x1,y1][x2,y2]. "
+                            "Be precise: the centre of these bounds is where the tap will land."
                         ),
                     },
                 ],
@@ -749,6 +868,10 @@ class AndroidAccessibilityTester:
                 model=model,
                 max_tokens=500,
             )
+            if element.found and scale < 1.0:
+                x1, y1, x2, y2 = (round(v / scale) for v in element.box())
+                element.bounds = f"[{x1},{y1}][{x2},{y2}]"
+            return element
         finally:
             if os.path.exists(path):
                 os.unlink(path)

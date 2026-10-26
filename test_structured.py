@@ -307,8 +307,8 @@ def tester(monkeypatch, tmp_path):
     t = AndroidAccessibilityTester(api_key="not-a-real-key")
 
     def fake_screenshot(output_path):
-        with open(output_path, "wb") as f:
-            f.write(b"\x89PNG\r\n\x1a\n" + b"fake image bytes")
+        from PIL import Image
+        Image.new("RGB", (40, 60), "gray").save(output_path)   # observe() frames it with rulers
         return output_path
 
     def fake_shell(command):
