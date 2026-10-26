@@ -1,54 +1,92 @@
 # Android Accessibility Tester
 
-A Python framework for integration testing Android apps that use accessibility services, using ADB commands, screenshots, and Claude AI for visual validation.
+A Python framework for integration testing Android apps that hold accessibility permissions. It
+drives the device with ADB and reads the screen with Claude's vision, so it never runs an
+accessibility service of its own and never disturbs the one under test.
 
-## Overview
+## API
 
-This framework enables testing Android accessibility services without requiring another accessibility service to run the tests (which would conflict). It uses ADB shell commands to interact with devices and Claude's vision capabilities to validate UI states through screenshots.
+Everything below is importable from `android_accessibility_tester`. Each method is described in
+its own section further down.
+
+```python
+tester = AndroidAccessibilityTester(device_id=None, model=None, api_key=None)
+```
+
+**Model-backed** (one Claude call each)
+
+| Method | Returns |
+|---|---|
+| `check(description, screenshot_path=None, model=None)` | `Check` — truthy if the screen matches the description |
+| `extract(description, schema, model=None)` | an instance of `schema`, a pydantic model |
+| `observe(description, model=None)` | `Element` or `None` |
+| `act(target, model=None)` | `ActResult` — `target` is a description, or a cached `Element` (no model call) |
+
+**Waiting** (no model calls)
+
+| Method | Returns |
+|---|---|
+| `wait_for(condition, timeout=10.0, poll_interval=0.5)` | `Result` |
+| `expect(condition, timeout=10.0, poll_interval=0.5)` | `Expectation` context manager; arms before the body, waits after |
+
+Conditions: `PixelColor(x, y, colors, exclude=False)`, `PixelChanged(x, y)`,
+`Logcat(tag, message, clear_first=True)`, `AnyOf(*conditions)`.
+
+**Device control** (plain ADB)
+
+| Method | Notes |
+|---|---|
+| `tap(x, y)`, `long_press(x, y, duration_ms=1000)`, `swipe(x1, y1, x2, y2, duration_ms=1000)` | |
+| `input_text(text)`, `press_key(keycode)`, `press_back()` | |
+| `open_app(package_name)`, `list_devices()`, `shell(command)` | `shell` returns stdout |
+| `screenshot(output_path)` | saves a PNG, returns the path |
+| `capture()` | `Capture` with `.screenshot`, `.pixel(x, y)`, `.release()` |
+
+**Failure artifacts**
+
+| Function | Notes |
+|---|---|
+| `failure_artifact_hook(item, call)` | call from `pytest_runtest_makereport` in `conftest.py` |
+| `save_debug_artifacts(output_dir, test_name, step_name, screenshot=True, ui_dump=True, existing_screenshot=None)` | screenshot and `uiautomator` dump; failure path only |
+
+**Types**
+
+- `Result` — `.ok`, `.error`. Subclasses: `Check` (`.screenshot`), `ActResult` (`.element`),
+  `PixelResult` (`.initial_color`, `.final_color`), `LogcatResult` (`.line`).
+- `Element` — `.bounds`, `.box()` → `(x1, y1, x2, y2)`, `.center()` → `(x, y)`, `.explanation`.
 
 ## Design
 
-The API is organized around **what you want**, not which mechanism supplies it, and is layered by cost and determinism. Reach for the lowest rung that can express your intent:
+The API is organized around **what you want**, not which mechanism supplies it, and is layered by
+cost and determinism. Reach for the lowest rung that can express your intent:
 
 1. **Deterministic, free** — `tap`, `swipe`, `input_text`, `press_key`, `shell`, `screenshot`
 2. **Deterministic, polled** — `wait_for(condition)`
 3. **Cached** — `observe()` once, then `act(element)` with no model calls
 4. **Model-backed** — `check()`, `extract()`, `act("natural language")`
 
-Every model call uses structured outputs (`output_config.format`) with a pydantic schema, so responses are validated JSON rather than prose that has to be parsed. Forced tool use is not used: the newest models reject `tool_choice: tool`/`any` with a 400.
+Every model call uses structured outputs with a pydantic schema, so responses are validated JSON.
+Forced tool use is not used: the newest models reject `tool_choice: tool`/`any` with a 400.
 
-## Core Components
-
-### AndroidAccessibilityTester
-
-Main class in `android_accessibility_tester.py`.
-
-```python
-tester = AndroidAccessibilityTester(
-    device_id=None,      # Specific device ID, or None for first available
-    model=None,          # Claude model; defaults to newest Sonnet via the Models API
-    api_key=None         # Anthropic API key, defaults to ANTHROPIC_API_KEY env var
-)
-```
-
-Model resolution when `model=None`: `SCREEN_AGENT_MODEL` env override → newest Sonnet via the Anthropic Models API → pinned `claude-sonnet-4-6` fallback. Cached per process.
+Model resolution when `model=None`: `SCREEN_AGENT_MODEL` env override → newest Sonnet via the
+Anthropic Models API → pinned `claude-sonnet-4-6` fallback. Cached per process.
 
 ## Results
 
-Every outcome-carrying method returns a `Result`: truthy when `ok`, with `.error` holding one sentence explaining failure. Its `__repr__` leads with that sentence, so a bare `assert` produces a useful pytest message.
+Every outcome-carrying method returns a `Result`: truthy when `ok`, with `.error` holding one
+sentence explaining failure. Its `__repr__` leads with that sentence, so a bare `assert` produces
+a useful pytest message.
 
 ```python
 result = tester.wait_for(Logcat("MyService", "ready"), timeout=30)
 assert result            # on failure: "LogcatResult(ok=False): Timeout after 30s - ..."
 ```
 
-Subclasses add diagnostics: `Check.screenshot`, `PixelResult.initial_color` / `.final_color`, `LogcatResult.line`, `ActResult.element`.
+## check
 
-## Visual Validation
-
-**check(description, screenshot_path=None, model=None) → Check**
-
-Captures a screenshot and validates it against a natural-language description. The screenshot is discarded when the check passes and kept when it fails (path in `.screenshot`); pass `screenshot_path` to always keep it.
+Captures a screenshot and validates it against a natural-language description. The screenshot
+is discarded when the check passes and kept when it fails (path in `.screenshot`); pass
+`screenshot_path` to always keep it.
 
 ```python
 assert tester.check(
@@ -57,13 +95,12 @@ assert tester.check(
 )
 ```
 
-**Important:** The description should be precise and comprehensive — the check only passes if ALL described elements are present and accurate.
+The check only passes if ALL described elements are present and accurate, so be precise. When
+asserting on a value, prefer `extract`.
 
-## Data Extraction
+## extract
 
-**extract(description, schema, model=None) → schema instance**
-
-Reads structured data off the screen into a pydantic model, using both the screenshot and the accessibility hierarchy. Turns prose assertions into ordinary ones.
+Reads structured data off the screen into a pydantic model, so assertions are ordinary ones.
 
 ```python
 from pydantic import BaseModel
@@ -78,48 +115,32 @@ assert state.remaining_seconds > 0
 assert state.is_running
 ```
 
-Field docstrings and `Field(description=...)` are what steer the model — they replace prompt text. Keep extraction schemas flat where possible; deeply nested models produce `$ref`/`$defs` in the JSON Schema.
+Field docstrings and `Field(description=...)` are what steer the model. Keep schemas flat where
+possible; nested models produce `$ref`/`$defs` in the JSON Schema.
 
-## Element Location and Interaction
+## observe and act
 
-**observe(description, model=None) → Element | None**
-
-Finds an element on screen without acting on it. The screenshot is read visually; nothing
-touches the UI hierarchy. The returned `Element` carries `bounds` in device pixels, so it can be
-cached by the caller and replayed later.
-
-```python
-start = tester.observe("the Start Timer button")
-if start:
-    tester.tap(*start.center())
-```
-
-`Element` has `.bounds`, `.box()` → `(x1, y1, x2, y2)`, `.center()` → `(x, y)`, and `.explanation`.
-
-**act(target, model=None) → ActResult**
-
-Taps an element. Given a string, locates it with `observe()` (one model call). Given a cached `Element`, replays its coordinates with **no model call**.
+`observe()` finds an element on screen from the screenshot alone and returns an `Element` with
+`bounds` in device pixels. `act()` taps: given a string it calls `observe()` first (one model
+call); given a cached `Element` it replays the coordinates with **no model call** and nothing
+else touching the device.
 
 ```python
 assert tester.act("tap the Start Timer button")
 
-# Observe once, replay many times — no further model calls
-start = tester.observe("the Start Timer button")
+start = tester.observe("the Start Timer button")   # one model call
 for _ in range(10):
-    tester.act(start)
+    tester.act(start)                              # none
 ```
 
-A cached `Element` replays its own coordinates — no model call, no screenshot, nothing that
-touches the device beyond the tap itself. There is no re-resolution against a live hierarchy,
-so a replay does not survive a layout shift; re-`observe()` when the layout changes.
+A replay does not survive a layout shift. Re-`observe()` when the layout changes.
 
-## Waiting
+When a description fits both a label and a tappable control, `observe()` prefers the control.
 
-**wait_for(condition, timeout=10.0, poll_interval=0.5) → Result**
+## wait_for and expect
 
-One verb for all waiting. The condition is checked once before the first sleep, so an already-satisfied condition returns immediately. Each poll captures the screen at most once regardless of how many conditions inspect it.
-
-Conditions:
+`wait_for` polls a condition until it holds or the timeout passes. The condition is checked once
+before the first sleep, so an already-satisfied condition returns immediately.
 
 | Condition | Waits for |
 |---|---|
@@ -130,16 +151,14 @@ Conditions:
 
 ```python
 tester.wait_for(PixelColor(300, 1380, ["#fffad0", "#d2cea4"]), timeout=30)
-tester.wait_for(PixelColor(300, 1380, ["#ffffff", "#1b1b1b"], exclude=True))
 assert tester.wait_for(Logcat("MyService", "upload finished"), timeout=30)
 assert tester.wait_for(AnyOf(Logcat("Overlay", "created"), PixelChanged(300, 1380)))
 ```
 
-**expect(condition, timeout=10.0, poll_interval=0.5) → Expectation**
-
-`wait_for` for signals the action itself produces. It arms the condition on entry, runs the
-body, and waits on exit. After the block the `Expectation` is truthy if the condition was met
-and forwards `.error`, `.line`, `.final_color` and so on from the underlying `Result`.
+`expect` is `wait_for` for signals the action itself produces. It arms the condition on entry,
+runs the body, and waits on exit. Use it for `Logcat`: the condition clears the log buffer when
+it starts listening, so with act-then-`wait_for` a fast service can log its line before the
+clear and the wait times out. If the body raises, the exception propagates without waiting.
 
 ```python
 with tester.expect(Logcat("MyService", "overlay created"), timeout=30) as created:
@@ -147,67 +166,11 @@ with tester.expect(Logcat("MyService", "overlay created"), timeout=30) as create
 assert created
 ```
 
-Why this exists: `Logcat` clears the log buffer when it starts listening, so stale lines from
-an earlier test cannot produce a false pass. With act-then-`wait_for`, that clear runs *after*
-the tap. A fast service logs its line in the gap, the clear wipes it, and the wait times out
-even though the app did the right thing. `expect` puts the clear before the tap. If the body
-raises, the condition is torn down without waiting and the exception propagates.
+For an app you control, `Logcat` is the strongest wait: exact, free, and disturbs nothing.
 
-There are no element-based conditions: every way of reading the hierarchy either disturbs the
-app under test or is unreliable. See the constraint section below.
+## capture
 
-## The Accessibility Service Constraint
-
-This framework tests apps that hold accessibility permissions, so nothing on the happy path
-may disturb them. In practice that rules out reading the UI hierarchy at all.
-
-**`uiautomator dump`** runs through `UiAutomation`, which suppresses the accessibility
-services of the app under test. `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES` exists but is only
-settable from instrumentation code, so `adb shell` cannot pass it. The failure is quiet: the
-service stays bound and enabled while its events stop arriving, so a state check will not
-catch it.
-
-**`dumpsys activity top`** was tried as a replacement in 3.2.0 and removed in 4.0.0. It never
-touches `UiAutomation`, but measured on a real device it fails three ways: it carries **no
-text**; it cannot see `SYSTEM_ALERT_WINDOW` overlays, because it enumerates Activities and an
-overlay added by a Service has no `ActivityRecord`; and it fans binder calls out to every task
-on the device, so one hung app takes the whole dump down with a 10-second timeout. Worse, a
-timed-out dump parses as an empty tree, which silently reads as "nothing is on screen" — an
-`ElementGone` check would pass while the element was still there.
-
-**So the framework reads the screen visually.** `uiautomator dump` survives in exactly one
-place: `save_debug_artifacts`, on the failure path, where the test is already over.
-
-### What that costs
-
-There is no element location by resource id, and no waiting on an element by id or text. What
-remains for deterministic waiting is `PixelColor`, `PixelChanged` and `Logcat`.
-
-For an app you control, `Logcat` is usually the strongest option — it is exact, free, needs no
-model call, and disturbs nothing:
-
-```python
-with tester.expect(Logcat("MyAccessibilityService", "overlay created"), timeout=30) as created:
-    tester.act("tap the Start button")
-assert created
-```
-
-### Options if you need a real hierarchy
-
-- **An instrumentation APK** using `setUiAutomationFlags(FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES)`.
-  Full fidelity including text and overlay windows, at the cost of a test APK driven by
-  `am instrument`. Verify it functionally before trusting it — the silent failure above means a
-  state check proves nothing.
-- **A debug-only receiver inside the app under test** that walks its own view tree and returns
-  JSON. Full text, sees its own overlays, immune to other apps, no accessibility interaction.
-  Only covers your own app.
-
-## Capturing State
-
-**capture() → Capture**
-
-A screenshot of the current moment, held for later comparison. No model call, nothing that
-disturbs the app.
+A screenshot of the current moment, held for later comparison. No model call.
 
 ```python
 before = tester.capture()
@@ -216,10 +179,26 @@ after = tester.capture()
 before.release()   # deletes the file
 ```
 
-### Failure Artifacts
+## The accessibility service constraint
 
-The one safe place for a `uiautomator` dump is after a test has already failed. `conftest.py`
-wires this up:
+Nothing on the happy path may read the UI hierarchy. `uiautomator dump` runs through
+`UiAutomation`, which silently suppresses the accessibility services of the app under test: the
+service stays enabled while its events stop arriving. `dumpsys activity top` was tried instead
+and removed in 4.0.0: it carries no text, cannot see overlays, and a timed-out dump parses as an
+empty screen. See the CHANGELOG for the measurements.
+
+So the framework reads the screen visually, and there are no element-based conditions or
+lookups by resource id. `uiautomator dump` survives in exactly one place: failure artifacts,
+after the test is already over.
+
+If you need a real hierarchy: an instrumentation APK with
+`FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES` gives full fidelity, or a debug-only receiver inside
+your own app can walk its own view tree. Verify either functionally, since the suppression is
+silent.
+
+## Failure artifacts
+
+`conftest.py` saves a screenshot and a hierarchy dump when a test fails:
 
 ```python
 from android_accessibility_tester import failure_artifact_hook
@@ -228,51 +207,38 @@ def pytest_runtest_makereport(item, call):
     failure_artifact_hook(item, call)
 ```
 
-On failure this saves a screenshot and a full hierarchy dump to `$ANDROID_TEST_ARTIFACTS`
-(default `./test-failures`), named after the test. It finds the tester by type among the test's
-fixtures, so the fixture can be called anything. If the last `check()` failed, its screenshot
-is reused, so the artifact is what the model actually judged. Errors while saving are printed
-and swallowed, so artifact capture can never mask the real failure.
+Artifacts go to `$ANDROID_TEST_ARTIFACTS` (default `./test-failures`), named after the test. The
+tester is found by type among the test's fixtures, so the fixture can have any name. If the last
+`check()` failed, its screenshot is reused. Errors while saving are printed and swallowed. Copy
+`conftest.py` into your own suite to get the same behaviour.
 
-Copy `conftest.py` into your own suite to get the same behaviour.
-
-## Device Control
-
-- `shell(command)` — arbitrary ADB shell command
-- `screenshot(output_path)` — capture to a local path
-- `tap(x, y)`, `long_press(x, y, duration_ms=1000)`, `swipe(x1, y1, x2, y2, duration_ms=1000)`
-- `input_text(text)` — type into the focused field
-- `press_key(keycode)`, `press_back()`
-- `open_app(package_name)`, `list_devices()`
-- `save_debug_artifacts(output_dir, test_name, step_name, ...)` — screenshot + UI dump for post-mortems
-
-## Setup & Usage
+## Setup and usage
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -e .
-```
-
-Prerequisites: ADB (Android SDK Platform Tools), `ANTHROPIC_API_KEY`, and a connected device or running emulator.
-
-```bash
 export ANTHROPIC_API_KEY=your_api_key_here
 ./venv/bin/pytest example_test.py
 ```
 
-Unit tests for the framework itself need no device or API key. The `Logcat` tests run the
-real subprocess code against a fake `adb` script placed on `PATH`, backed by a plain file:
+Prerequisites: ADB (Android SDK Platform Tools), `ANTHROPIC_API_KEY`, and a connected device or
+running emulator.
+
+Unit tests for the framework need no device or API key. The `Logcat` tests run the real
+subprocess code against a fake `adb` script placed on `PATH`:
 
 ```bash
 ./venv/bin/pytest test_structured.py test_wait.py test_act.py test_failure_artifacts.py test_images.py
 ```
 
-## Example Test Structure
+`test_find_coordinates.py` exercises `observe()` and needs a device and an API key.
+
+A typical test:
 
 ```python
 import android_accessibility_tester
-from android_accessibility_tester import Logcat, PixelColor
+from android_accessibility_tester import Logcat
 import pytest
 
 @pytest.fixture(scope="function")
@@ -288,71 +254,27 @@ def test_my_feature(tester):
     assert tester.check("the results list is showing with at least one row")
 ```
 
-## Error Handling
+## Error handling
 
-### Transient API Errors
+Claude API calls retry with exponential backoff (1s, 2s, 4s, 8s, then one final attempt) for
+`RateLimitError`, `InternalServerError`, `APITimeoutError`, and `APIConnectionError`.
 
-Claude API calls retry with exponential backoff (1s, 2s, 4s, 8s, then one final attempt) for `RateLimitError`, `InternalServerError`, `APITimeoutError`, and `APIConnectionError`. Implemented once in `structured_call`.
+If a response doesn't validate against the requested schema, the pydantic errors are sent back
+to the model and it retries once. If it still fails, `StructuredCallError` is raised. Pydantic's
+lax mode coerces some values: `"yes"`, `"on"` and `"1"` all validate as `True` for a `bool`.
+Use strict types if you need that rejected.
 
-### Schema Violations
+## Implementation notes
 
-If a response doesn't validate against the requested schema (or is not JSON), the pydantic errors are sent back to the model as a follow-up user message and it retries once. If it still fails, `StructuredCallError` is raised.
-
-Note that pydantic's default lax mode coerces some values — `"yes"`, `"on"` and `"1"` all validate as `True` for a `bool` field. Use strict types if you need that rejected.
-
-## Implementation Notes
-
-### Text Input Encoding
-
-`input_text()` handles ADB requirements: spaces become `%s`, and `()` are escaped.
-
-### Screenshot Workflow
-
-Device captures to `/sdcard/screenshot.png`, ADB pulls to the local path, the device file is removed (failure ignored — scoped storage may block `rm`).
-
-### Screenshot Scaling
-
-The API shrinks any image over about 1.15 megapixels before the model sees it, and a phone
-screenshot is well over that. Some models then answer in the shrunken image's coordinates: on a
-1080x2400 Pixel 8, Sonnet 4.6 returned every position scaled by 0.666, so no tap landed.
-
-So `observe()` does the shrinking itself. `fit_for_model()` resizes the screenshot to the cap at
-a known scale, the prompt tells the model the image's dimensions, and the returned bounds are
-divided by the scale back into device pixels. Screenshots already under the cap are sent as is.
-`check()` and `extract()` send the raw screenshot, since they report on content, not position.
-
-Measured offline on five Clock screens, 42 controls described the way a test author would
-write them, scored against `uiautomator` dumps:
-
-| Model | Raw screenshot | Resized, scaled back |
-|---|---|---|
-| Sonnet 5.5 | 35 hits of 42, median 3 px | 42 of 42, median 5 px |
-| Sonnet 4.6 | 0 hits of 42, median 606 px | 42 of 42, median 25 px |
-
-(The raw-screenshot column was measured with auto-generated descriptions, under which 5.5's
-misses were ambiguous labels rather than coordinate errors.)
-
-Coordinate rulers in a margin around the screenshot were also tried (`add_rulers()`, kept and
-tested). They did not help Sonnet 5.5 and made Sonnet 4.6 worse: it read the vertical ruler
-loosely and ignored the horizontal one. They are not used.
-
-`calibration/pixel8/` holds the screenshots and dumps; `calibration/measure.py` reruns the
-measurement for any model, with no device, so a model change can be checked before it ships.
-
-## Tips & Best Practices
-
-1. **Observe once, replay after** — `observe()` costs a model call; `act(element)` on a cached
-   Element costs none. Re-observe when the layout changes.
-2. **Precise descriptions** — `check()` only passes if all described elements match.
-3. **Prefer `extract` over prose checks** when asserting on a value: `assert state.remaining_seconds > 0` beats describing the whole screen.
-4. **Per-test cleanup** — use function-scoped fixtures for clean state between tests.
-
-## Architecture
-
-The framework avoids conflicts with accessibility service apps:
-- Uses ADB shell commands instead of accessibility APIs
-- Runs externally to the Android system
-- Can test apps that hold accessibility service permissions
+- `input_text()` escapes for ADB: spaces become `%s`, and `()` are escaped.
+- Screenshots are captured to `/sdcard/screenshot.png`, pulled, and the device file removed
+  (failure ignored, since scoped storage may block `rm`).
+- The API shrinks any image over about 1.15 megapixels, and some models then answer in the
+  shrunken image's coordinates. So `observe()` resizes the screenshot itself with
+  `fit_for_model()`, tells the model the image size, and divides the returned bounds back into
+  device pixels. `check()` and `extract()` send the raw screenshot. `calibration/measure.py`
+  reruns the coordinate measurement for any model without a device, so a model change can be
+  checked before it ships.
 
 ## License
 

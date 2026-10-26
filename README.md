@@ -40,8 +40,8 @@ action is what produces the signal. Plain `wait_for()` is for signals that will 
 their own.
 
 `observe()` locates an element and returns it *without* acting. Cache that result and `act()`
-on it to replay the tap with no further model calls — this is the droidrun-and-hardcode
-workflow with the manual step removed. Re-observe when the layout changes:
+on it to replay the tap with no further model calls, so you get hard-coded coordinates
+without finding them by hand. Re-observe when the layout changes:
 
 ```python
 start = tester.observe("the Start Timer button")   # one model call
@@ -65,5 +65,3 @@ assert state.remaining_seconds > 0
 ```
 
 See CLAUDE.md for the full API.
-
-Droidrun is also useful for identifying element coordinates by hand (though it cannot be running while testing an app that uses accessibility services, since only one app can hold the permissions at a time).
